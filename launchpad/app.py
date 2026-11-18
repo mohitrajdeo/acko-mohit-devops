@@ -542,6 +542,7 @@ def api_admin_overview():
 
     return jsonify(teams=teams,
                    team_detail=team_detail,
+                   resources=_system_resources(),
                    failures_24h={r["team"]: r["n"] for r in recent},
                    control_plane=preflight["status"],
                    control_plane_detail=f"{preflight.get('total', '?') - (preflight.get('failed') or 0)}"
@@ -639,6 +640,50 @@ def api_preflight():
         return jsonify(verdict)
     except Exception as e:
         return jsonify(status="UNKNOWN", error=str(e)[:120], results=[])
+
+
+def _system_resources():
+    """Control-plane host resources, read straight from /proc (no deps)."""
+    try:
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            if k in ("MemTotal", "MemAvailable"):
+                mem[k] = int(v.strip().split()[0])  # kB
+        total_kb, avail_kb = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+        ram_pct = round(100 * (1 - avail_kb / total_kb), 1) if total_kb else None
+
+        # CPU: /proc/stat since boot (user+nice+system columns vs total)
+        cpu_pct = None
+        f = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+        if len(f) >= 4:
+            vals = [int(x) for x in f]
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+            total = sum(vals)
+            cpu_pct = round(100 * (1 - idle / total), 1) if total else None
+
+        import shutil
+        du = shutil.disk_usage("/")
+        disk_pct = round(100 * du.used / du.total, 1)
+        ncpu = None
+        try:
+            ncpu = len(Path("/proc/cpuinfo").read_text().split(
+                "processor")) - 1
+        except Exception:
+            pass
+        return {"ram_used_pct": ram_pct,
+                "ram_total_gb": round(total_kb / 1024 / 1024, 1),
+                "cpu_used_pct": cpu_pct, "cpu_cores": ncpu,
+                "disk_used_pct": disk_pct,
+                "disk_free_gb": round(du.free / 1024**3, 1)}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+@app.get("/api/system/resources")
+def api_system_resources():
+    """Live CPU / RAM / disk of the control-plane host."""
+    return jsonify(_system_resources())
 
 
 @app.get("/api/metrics")
@@ -897,6 +942,19 @@ async function load(){
   cp.innerHTML = o.control_plane==="READY"
     ? "<span class=ok>● READY</span> — " + o.control_plane_detail
     : "<span class=bad>● " + o.control_plane + "</span> — " + o.control_plane_detail;
+  const r = o.resources || {};
+  if (!r.error) {
+    const bar = (label, pct, extra) => {
+      const c = pct > 85 ? "#c0392b" : pct > 70 ? "#b35400" : "green";
+      return `<div style="margin-top:6px">${label}
+        <div style="background:#e0e4ea;border-radius:4px;height:10px;width:100%">
+        <div style="background:${c};height:10px;width:${pct}%;border-radius:4px"></div></div>
+        <small>${pct}% used ${extra||""}</small></div>`;
+    };
+    cp.innerHTML += bar("CPU", r.cpu_used_pct ?? 0, r.cpu_cores ? `· ${r.cpu_cores} cores` : "")
+      + bar("RAM", r.ram_used_pct ?? 0, `· ${r.ram_total_gb} GB total`)
+      + bar("Disk", r.disk_used_pct ?? 0, `· ${r.disk_free_gb} GB free`);
+  }
   fails.innerHTML = Object.keys(o.failures_24h||{}).length
     ? Object.entries(o.failures_24h).map(([t,n])=>`${t}: <span class=bad>${n}</span>`).join("<br>")
     : "<span class=ok>none</span>";
