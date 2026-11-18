@@ -15,7 +15,8 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 DB = Path(__file__).parent / "launchpad.db"
-HEALTH_RETRIES = 3          # DECISIONS.md: 3 probes x 30s window, my call
+HEALTH_RETRIES = 3
+DEPLOY_QUEUE_WAIT = 180     # max seconds a queued deploy waits for the lock          # DECISIONS.md: 3 probes x 30s window, my call
 HEALTH_INTERVAL = 3         # shortened for demo speed (logged in DECISIONS.md)
 WEBHOOK_URL = "http://localhost:9900/hook"
 SERVICE_PORT_BASE = 8100    # deployed containers get 8100, 8101, ...
@@ -232,10 +233,23 @@ def deploy(service_id, version, environment):
         deploy_id = cur.lastrowid
         container = f"lp-{svc['name']}-{environment}"
 
-    if not acquire_lock(service_id, environment):
-        _finish_deploy(deploy_id, "rejected",
-                       f"a deploy for {svc['name']}/{environment} is already in progress")
-        return deploy_id
+    # deploy queue: a concurrent deploy WAITS for the running one (queued events),
+    # instead of being rejected outright
+    waited = 0
+    while not acquire_lock(service_id, environment):
+        if waited == 0:
+            log_event(deploy_id, "deploy.queued",
+                      f"waiting: a deploy for {svc['name']}/{environment} is in progress")
+        if waited >= DEPLOY_QUEUE_WAIT:
+            _finish_deploy(deploy_id, "rejected",
+                           f"queued too long (> {DEPLOY_QUEUE_WAIT}s) for "
+                           f"{svc['name']}/{environment}")
+            return deploy_id
+        time.sleep(2)
+        waited += 2
+    if waited:
+        log_event(deploy_id, "deploy.dequeued",
+                  f"lock acquired after {waited}s wait — deploying now")
     log_event(deploy_id, "deploy.started", f"{svc['name']} {version} -> {environment}")
 
     # unique port per (service, environment) so staging and prod can run side by side
@@ -492,15 +506,32 @@ def api_admin_overview():
         return err
     with db() as c:
         teams = {}
-        for r in c.execute(
-                "SELECT s.name, s.team, COALESCE(p.version,'—') as version, "
-                "COALESCE(p.environment,'—') as environment, "
-                "CASE WHEN p.version IS NULL THEN 'never deployed' ELSE 'running' END as status "
-                "FROM services s LEFT JOIN pointers p ON p.service_id=s.id").fetchall():
-            t = r["team"] or "unassigned"
-            teams.setdefault(t, []).append(
-                {"service": r["name"], "version": r["version"],
-                 "env": r["environment"], "status": r["status"]})
+        for svc in c.execute("SELECT id, name, team FROM services ORDER BY id").fetchall():
+            t = svc["team"] or "unassigned"
+            ptrs = c.execute(
+                "SELECT environment, version FROM pointers WHERE service_id=?",
+                (svc["id"],)).fetchall()
+            rows = []
+            if ptrs:
+                for p_ in ptrs:
+                    rows.append({"service": svc["name"], "version": p_["version"],
+                                 "env": p_["environment"], "status": "running"})
+            else:
+                # no pointer (deployed before pointer table, or rollback ended it):
+                # fall back to the latest deploy row — never show a blank lie
+                d = c.execute(
+                    "SELECT version, environment, status FROM deploys "
+                    "WHERE service_id=? ORDER BY id DESC LIMIT 1",
+                    (svc["id"],)).fetchone()
+                if d:
+                    rows.append({"service": svc["name"], "version": d["version"],
+                                 "env": d["environment"],
+                                 "status": ("running" if d["status"] == "healthy"
+                                            else d["status"])})
+                else:
+                    rows.append({"service": svc["name"], "version": "—",
+                                 "env": "—", "status": "never deployed"})
+            teams.setdefault(t, []).extend(rows)
         # failed deploys last 24h per team
         recent = c.execute(
             "SELECT s.team, COUNT(*) n FROM deploys d JOIN services s ON s.id=d.service_id "
@@ -640,6 +671,40 @@ def api_preflight():
         return jsonify(verdict)
     except Exception as e:
         return jsonify(status="UNKNOWN", error=str(e)[:120], results=[])
+
+
+# --- post-deploy watchdog: notify when a running service goes DOWN ---
+_down_alerted = set()
+
+
+def _watchdog_once():
+    """Check every pointer's container; alert (only) when it stopped running."""
+    with db() as c:
+        ptrs = c.execute(
+            "SELECT p.service_id, p.environment, p.container, s.name "
+            "FROM pointers p JOIN services s ON s.id=p.service_id").fetchall()
+    for p_ in ptrs:
+        key = (p_["service_id"], p_["environment"])
+        st = run(f"docker inspect -f '{{{{.State.Status}}}}' {p_['container']} "
+                 f"2>/dev/null").stdout.strip()
+        if st == "running":
+            _down_alerted.discard(key)
+            continue
+        if key in _down_alerted:
+            continue            # already told — no notification spam
+        _down_alerted.add(key)
+        log_event(None, "service.down",
+                  f"{p_['name']} ({p_['environment']}) is DOWN — container "
+                  f"{p_['container']} is '{st or 'gone'}'; manual rollback advised")
+
+
+def _watchdog_loop():
+    while True:
+        try:
+            _watchdog_once()
+        except Exception:
+            pass
+        time.sleep(60)
 
 
 def _system_resources():
@@ -1125,4 +1190,5 @@ async function rollbackSvc(name) {{
 
 if __name__ == "__main__":
     init_db()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=7000)
