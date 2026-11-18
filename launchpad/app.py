@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request
 
 DB = Path(__file__).parent / "launchpad.db"
 HEALTH_RETRIES = 3          # DECISIONS.md: 3 probes x 30s window, my call
-HEALTH_INTERVAL = 5         # shortened for demo speed (logged in DECISIONS.md)
+HEALTH_INTERVAL = 3         # shortened for demo speed (logged in DECISIONS.md)
 WEBHOOK_URL = "http://localhost:9900/hook"
 SERVICE_PORT_BASE = 8100    # deployed containers get 8100, 8101, ...
 
@@ -124,7 +124,9 @@ def deploy(service_id, version, environment):
 
     log_event(deploy_id, "deploy.started", f"{svc['name']} {version} -> {environment}")
 
-    host_port = SERVICE_PORT_BASE + service_id
+    # unique port per (service, environment) so staging and prod can run side by side
+    env_offset = 100 if environment == "prod" else 0
+    host_port = SERVICE_PORT_BASE + service_id + env_offset
     env_flags = " ".join(f"-e {k}={v}" for k, v in env_vars.items())
     image = f"localhost:5000/{svc['name']}:{version}"
     # stop (not remove) old container so we can recover if the new one fails
@@ -222,7 +224,7 @@ def _get_env_vars(service_id, environment):
 # ---------------------------------------------------------------- API
 @app.post("/api/services")
 def api_register():
-    b = request.json
+    b = request.json or {}
     with db() as c:
         cur = c.execute("INSERT INTO services(name,repo_path,dockerfile,port,health_path) "
                         "VALUES(?,?,?,?,?)",
@@ -234,16 +236,31 @@ def api_register():
 
 @app.post("/api/services/<int:sid>/build")
 def api_build(sid):
-    version = request.json["version"]
+    version = (request.json or {}).get("version", "")
     ok, build_id = do_build(sid, version)
     return jsonify(build_id=build_id, ok=ok)
 
 
 @app.post("/api/services/<int:sid>/deploy")
 def api_deploy(sid):
-    b = request.json
+    b = request.json or {}
     did = deploy(sid, b["version"], b.get("environment", "staging"))
     return jsonify(deploy_id=did)
+
+
+@app.post("/api/services/<int:sid>/promote")
+def api_promote(sid):
+    """Promote the version currently healthy in staging to prod (one action)."""
+    b = request.json or {}
+    with db() as c:
+        row = c.execute(
+            "SELECT version FROM deploys WHERE service_id=? AND environment='staging' "
+            "AND status='healthy' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+        if not row:
+            return jsonify(error="no healthy staging version to promote"), 400
+    version = row["version"]
+    did = deploy(sid, version, b.get("environment", "prod"))
+    return jsonify(deploy_id=did, promoted=version)
 
 
 @app.post("/api/deploys/<int:did>/rollback")
