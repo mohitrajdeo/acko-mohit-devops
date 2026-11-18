@@ -404,24 +404,101 @@ def rows(cursor):
 def ui():
     with db() as c:
         svc_rows = c.execute(
-            "SELECT s.name, COALESCE(d.version,'—') as running, d.environment, d.status "
+            "SELECT s.name, s.id, COALESCE(d.version,'—') as version, d.environment, d.status "
             "FROM services s LEFT JOIN deploys d ON d.id = "
             "(SELECT id FROM deploys WHERE service_id=s.id ORDER BY id DESC LIMIT 1)"
         ).fetchall()
         ev_rows = c.execute("SELECT created_at,type,detail FROM events ORDER BY id DESC LIMIT 15").fetchall()
-    table1 = "".join(f"<tr><td>{r['name']}</td><td>{r['running']}</td>"
-                     f"<td>{r['environment'] or '—'}</td><td>{r['status'] or '—'}</td></tr>"
-                     for r in svc_rows)
-    table2 = "".join(f"<tr><td>{r['created_at']}</td><td>{r['type']}</td><td>{r['detail']}</td></tr>"
-                     for r in ev_rows)
-    return f"""<!doctype html><html><head><meta charset=utf-8><meta http-equiv=refresh content=5>
-<title>Launchpad</title><style>body{{font-family:system-ui;margin:24px}}
-table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:6px}}</style></head>
-<body><h1>🚀 Launchpad</h1>
-<h2>What's running where</h2><table><tr><th>Service</th><th>Version</th><th>Env</th><th>Status</th></tr>{table1}</table>
-<h2>Recent events</h2><table><tr><th>At</th><th>Event</th><th>Detail</th></tr>{table2}</table>
-<p>API: POST /api/services · /api/services/&lt;id&gt;/build · /api/services/&lt;id&gt;/deploy · /api/deploys/&lt;id&gt;/rollback</p>
-</body></html>"""
+        metrics = {r["service"]: r for r in _metrics_rows(c)}
+    svc_table = ""
+    for r in svc_rows:
+        m = metrics.get(r["name"], {})
+        dep_n = m.get("deploys_total", 0)
+        fail = m.get("deploy_failure_pct", 0.0)
+        mttr = m.get("mttr_minutes")
+        mttr_s = f"{mttr} min" if mttr is not None else "—"
+        badge = {"healthy": "🟢", "failed": "🔴", "rolled_back": "🟠",
+                 "rollback_failed": "🔴", "rejected": "🟠"}.get(r["status"], "⚪")
+        svc_table += (
+            f"<tr><td>{r['name']}</td><td>{badge} {r['status'] or 'never deployed'}</td>"
+            f"<td>{r['version']} ({r['environment'] or '—'})</td>"
+            f"<td>{dep_n} deploys · {fail}% failed · MTTR {mttr_s}</td>"
+            f"<td class=actions>"
+            f"<button onclick=deploySvc({r['id']},'{r['name']}')>Deploy</button> "
+            f"<button onclick=promoteSvc({r['id']})>Promote→prod</button> "
+            f"<button onclick=rollbackSvc('{r['name']}')>Rollback</button></td></tr>")
+    ev_table = "".join(
+        f"<tr><td>{r['created_at']}</td><td><b>{r['type']}</b></td><td>{str(r['detail'])[:90]}</td></tr>"
+        for r in ev_rows)
+    return PAGE.format(services=svc_table, events=ev_table)
+
+
+def _metrics_rows(c):
+    # reuse the metrics computation, but from an existing connection
+    out = []
+    for svc in c.execute("SELECT id, name FROM services").fetchall():
+        deploys = c.execute(
+            "SELECT status, started_at, finished_at FROM deploys "
+            "WHERE service_id=? ORDER BY id", (svc["id"],)).fetchall()
+        total = len(deploys)
+        failed = sum(1 for d in deploys if d["status"] in
+                     ("failed", "rolled_back", "rollback_failed"))
+        mttrs = []
+        for i, d in enumerate(deploys):
+            if d["status"] == "rolled_back" and d["started_at"] and d["finished_at"]:
+                gap = _minutes_between(d["started_at"], d["finished_at"])
+                if gap is not None:
+                    mttrs.append(gap)
+            elif d["status"] in ("failed", "rollback_failed"):
+                for later in deploys[i + 1:]:
+                    if later["status"] == "healthy":
+                        gap = _minutes_between(d["finished_at"], later["finished_at"])
+                        if gap is not None:
+                            mttrs.append(gap)
+                        break
+        out.append({"service": svc["name"], "deploys_total": total,
+                    "deploy_failure_pct": round(100 * failed / total, 1) if total else 0.0,
+                    "mttr_minutes": round(sum(mttrs) / len(mttrs), 1) if mttrs else None})
+    return out
+
+
+PAGE = """<!doctype html><html><head><meta charset=utf-8><meta http-equiv=refresh content=8>
+<title>Launchpad</title><style>
+body{{font-family:system-ui,sans-serif;margin:24px;background:#fafafa}}
+h1{{color:#1a3c6e}} table{{border-collapse:collapse;width:100%;background:#fff;margin-bottom:28px}}
+td,th{{border:1px solid #d8d8d8;padding:7px 10px;text-align:left;font-size:14px}}
+th{{background:#eef2f7}} .actions button{{margin:2px;padding:4px 10px;cursor:pointer}}
+.lead{{color:#555}} code{{background:#eef;padding:1px 4px}}
+</style></head><body>
+<h1>🚀 Launchpad</h1>
+<p class=lead>Deploy a version, check it is healthy, roll back in one click if it isn't.
+Every action announces itself on the webhook — no silent failures.</p>
+<h2>Services — what's running where</h2>
+<table><tr><th>Service</th><th>Current state</th><th>Version (env)</th><th>Delivery metrics</th><th>Actions</th></tr>
+{services}</table>
+<h2>Recent events</h2>
+<table><tr><th>At</th><th>Event</th><th>Detail</th></tr>{events}</table>
+<script>
+async function call(url, body) {{
+  const r = await fetch(url, {{method:"POST", headers:{{"Content-Type":"application/json"}},
+                               body: JSON.stringify(body || {{}})}});
+  const j = await r.json();
+  alert(JSON.stringify(j)); location.reload();
+}}
+function deploySvc(id, name) {{
+  const v = prompt("Version to build+deploy (git tag), e.g. v1.1.0:");
+  if (!v) return;
+  const env = prompt("Environment: staging or prod:", "staging") || "staging";
+  call("/api/services/" + id + "/build", {{version: v}}).then(() =>
+    call("/api/services/" + id + "/deploy", {{version: v, environment: env}}));
+}}
+function promoteSvc(id) {{ if (confirm("Promote current staging version to prod?")) call("/api/services/" + id + "/promote", {{}}); }}
+async function rollbackSvc(name) {{
+  const r = await fetch("/api/deploys"); const deploys = await r.json();
+  const d = deploys.find(x => x.service === name);
+  if (d && confirm("Roll back " + name + " to the last good version?")) call("/api/deploys/" + d.id + "/rollback", {{}});
+}}
+</script></body></html>"""
 
 
 if __name__ == "__main__":
