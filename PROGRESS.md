@@ -41,7 +41,7 @@ entries below are logged as they happened on build day.
   missing → unhealthy → failed gate). Working as designed; set prod config, promote
   succeeded.
 
-## Session 5 — edge cases (your multi-team question)
+## Session 5 — edge cases (multi-team question)
 
 - **13:25 — Rollback port bug found** (old port formula, no env offset) → fixed.
 - **13:30 — Concurrent deploy guard added:** two deploys for the same
@@ -54,8 +54,8 @@ entries below are logged as they happened on build day.
 
 - **13:50 — Delivery metrics live:** per service — deploys/day, failure %, MTTR.
   Real numbers from our tests: quote-svc MTTR **0.3 min** (auto-rollback recovery).
-- **13:55 — Dashboard UI:** what's running where (state badges), deploy/promote/
-  rollback buttons, inline metrics, event feed, auto-refresh.
+- **13:55 — Dashboard UI:** what's running where, deploy/promote/rollback buttons,
+  inline metrics, event feed, auto-refresh.
 - **14:05 — Reread plan against product → 3 gaps closed:** version discovery from
   git tags (not a blank prompt), rollback target choice among all healthy versions,
   build logs viewable via API.
@@ -72,13 +72,49 @@ entries below are logged as they happened on build day.
 - **14:18 — Failure-stage telemetry ("where did it turn red").** Health gate now
   classifies the failure: `never_started` (image/port/entrypoint),
   `startup_unreachable` (app crashes at boot — usually config/secrets),
-  `never_healthy` (reachable but stuck warming). Events + deploy row carry the stage;
-  live run classified policy-svc-style failures as `startup_unreachable` correctly.
+  `never_healthy` (reachable but stuck warming). Events + deploy row carry the stage.
 - **14:20 — e2e re-run: 15/15 ALL GREEN** after the upgrades (one regression caught
   en route: rollback endpoint unpacked the new tuple return — fixed).
 
-## Gate 2 status (what works now)
+## Session 8 — PO design thread (shared vs personalized)
 
-- All 10 must-haves built; 9 of them proven live by tests in this log.
-- Pending: README (run-from-scratch), REVIEW.md, final commit ritual.
-- Open PO question: shared vs personalized operator view (affects login layer).
+- **19:00 — PO confirmed shared view for demo scope; asked how personalization
+  would group.** 
+- **19:59 — Answered (email): team-based grouping + login; manager/admin sees all
+  teams AND control-plane health.** Both directions logged in DECISIONS.md.
+
+## Session 9 — auth + two-page UI (team-based views)
+
+- **14:30 — Auth backend:** users/sessions tables, stdlib password hashing,
+  first-user-becomes-manager bootstrap, roles (engineer/manager), team-scoped
+  deploys + events. Live-proven: engineer sees only own team (8 events vs
+  manager's 68), 403 on manager-only actions, shared-view fallback without session
+  (both PO answers honored: shared by default, scoped when logged in).
+- **14:35 — Two pages + redirect:** login page → manager lands on `/admin`,
+  engineer on `/dashboard`. Teams seeded `team1`/`team2`, demo accounts
+  `admin`/`team1`/`team2` (all `1234`).
+- **14:40 — Admin console:** control-plane health card (READY/degraded + re-run),
+  failures (24h) per team, all-teams "what's running where", per-team cards with
+  healthy count + last 5 deploys + last 5 events (user request: "last 5 per team").
+- **14:45 — Duplicate-state root cause fixed:** dashboards read the `pointers`
+  table (source of truth) instead of "newest deploy row", which lied after rollbacks.
+
+## Session 10 — closing the must-have wording + polish
+
+- **14:42 — Lead time to prod metric added** (median: first staging deploy → first
+  prod deploy of a version). Live: acceptance-svc 40.0 min, quote-svc 0.5 min.
+  Feature #9 wording now fully covered: ship frequency, lead time, failure %,
+  recovery speed.
+- **14:43 — Structured webhook payloads:** every event now carries `severity`
+  (info/warning/alert), service/version/environment context — real chat systems
+  can route alerts vs feed. (User: "make the webhook receiver good.")
+- **14:45 — e2e re-run: 15/15 ALL GREEN.**
+
+## Submission status
+
+- ✅ Code + 24 incremental commits
+- ✅ README.md (complete per PDF: run-from-scratch, pages, API, honest limits)
+- ✅ PLAN.md (frozen post-Gate-1), DECISIONS.md, DESIGN.md, COVERAGE.md, STATUS.md
+- ✅ Tests: preflight (13 checks) + e2e (15/15)
+- ✅ REVIEW.md (self-review per PDF)
+- ⏳ transcripts/ — user exports OpenCode sessions before final push
