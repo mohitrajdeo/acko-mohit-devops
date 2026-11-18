@@ -22,6 +22,21 @@ SERVICE_PORT_BASE = 8100    # deployed containers get 8100, 8101, ...
 
 app = Flask(__name__)
 
+# one deploy at a time per (service, environment) — concurrent deploys are rejected
+_deploy_locks = {}
+
+
+def acquire_lock(service_id, environment):
+    key = (service_id, environment)
+    if _deploy_locks.get(key):
+        return False
+    _deploy_locks[key] = True
+    return True
+
+
+def release_lock(service_id, environment):
+    _deploy_locks[(service_id, environment)] = False
+
 
 def db():
     conn = sqlite3.connect(DB)
@@ -122,6 +137,10 @@ def deploy(service_id, version, environment):
             "SELECT key,value FROM configs WHERE service_id=? AND environment=?",
             (service_id, environment))}
 
+    if not acquire_lock(service_id, environment):
+        _finish_deploy(deploy_id, "rejected",
+                       f"a deploy for {svc['name']}/{environment} is already in progress")
+        return deploy_id
     log_event(deploy_id, "deploy.started", f"{svc['name']} {version} -> {environment}")
 
     # unique port per (service, environment) so staging and prod can run side by side
@@ -140,6 +159,7 @@ def deploy(service_id, version, environment):
         if old_existed:
             run(f"docker start {container}")  # bring prod back on the old version
         _finish_deploy(deploy_id, "failed", r.stderr)
+        release_lock(service_id, environment)
         return deploy_id
 
     # health gate
@@ -169,6 +189,7 @@ def deploy(service_id, version, environment):
             log_event(deploy_id, "rollback.auto", "restored previous running version")
         else:
             _finish_deploy(deploy_id, "failed", "health gate failed, no previous version")
+    release_lock(service_id, environment)
     return deploy_id
 
 
@@ -199,7 +220,8 @@ def _auto_rollback(svc, failed_deploy_id, environment):
     container = f"lp-{svc['name']}-{environment}"
     env_vars = _get_env_vars(svc["id"], environment)
     env_flags = " ".join(f"-e {k}={v}" for k, v in env_vars.items())
-    host_port = SERVICE_PORT_BASE + svc["id"]
+    env_offset = 100 if environment == "prod" else 0
+    host_port = SERVICE_PORT_BASE + svc["id"] + env_offset
     run(f"docker rm -f {container} 2>/dev/null")
     r = run(f"docker run -d --name {container} {env_flags} "
             f"-p {host_port}:{svc['port']} localhost:5000/{svc['name']}:{good}")
