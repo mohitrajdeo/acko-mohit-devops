@@ -1,0 +1,63 @@
+{
+  "at": "2026-11-18T14:01:31",
+  "total": 11,
+  "failed": 0,
+  "results": [
+    {
+      "check": "docker daemon running",
+      "ok": true,
+      "detail": "29.8.0"
+    },
+    {
+      "check": "registry reachable (push target)",
+      "ok": true,
+      "detail": "registry /v2/ -> 200"
+    },
+    {
+      "check": "webhook receiver reachable (notifications)",
+      "ok": true,
+      "detail": "receiver :9900 -> 200"
+    },
+    {
+      "check": "disk space",
+      "ok": true,
+      "detail": "1008.5 GB free (need >2)"
+    },
+    {
+      "check": "disk inodes",
+      "ok": true,
+      "detail": "unknown"
+    },
+    {
+      "check": "git identity",
+      "ok": true,
+      "detail": "Mohit Raj Deo"
+    },
+    {
+      "check": "database writable",
+      "ok": true,
+      "detail": "db writable"
+    },
+    {
+      "check": "staging port for service 2",
+      "ok": true,
+      "detail": "port 8102 in use by managed container lp-policy-svc-prod (expected)"
+    },
+    {
+      "check": "prod port for service 2",
+      "ok": true,
+      "detail": "port 8202 free"
+    },
+    {
+      "check": "staging port for service 1",
+      "ok": true,
+      "detail": "port 8101 in use by managed container lp-quote-svc-staging (expected)"
+    },
+    {
+      "check": "prod port for service 1",
+      "ok": true,
+      "detail": "port 8201 in use by managed container lp-quote-svc-prod (expected)"
+    }
+  ],
+  "status": "READY"
+}

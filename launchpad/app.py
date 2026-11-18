@@ -365,6 +365,21 @@ def api_healthy_versions(sid):
     return jsonify([r["version"] for r in rows])
 
 
+@app.get("/api/preflight")
+def api_preflight():
+    """Live health of the control plane's dependencies (docker, registry, disk, ports)."""
+    import subprocess, json as _json
+    from pathlib import Path
+    here = Path(__file__).parent
+    try:
+        r = subprocess.run(["python3", str(here / "preflight.py")],
+                           capture_output=True, text=True, timeout=90)
+        verdict = _json.loads((here / "preflight.json").read_text())
+        return jsonify(verdict)
+    except Exception as e:
+        return jsonify(status="UNKNOWN", error=str(e)[:120], results=[])
+
+
 @app.get("/api/metrics")
 def api_metrics():
     """Delivery metrics per service: ship frequency, failure rate, MTTR."""
@@ -544,6 +559,12 @@ th{{background:#eef2f7}} .actions button{{margin:2px;padding:4px 10px;cursor:poi
 <h1>Launchpad</h1>
 <p class=lead>Deploy a version, check it is healthy, roll back in one click if it isn't.
 Every action announces itself on the webhook — no silent failures.</p>
+<div id=sysstatus style="padding:10px 14px;margin-bottom:20px;border:1px solid #ccc;background:#fff">
+  <b>Control plane:</b> <span id=sysline>checking…</span>
+  <button style="margin-left:12px" onclick=runPreflight()>Re-run checks</button>
+  <details style="margin-top:8px"><summary style="cursor:pointer">Details</summary>
+    <table id=sysdetail style="margin-top:8px"></table></details>
+</div>
 <h2>Services — what's running where</h2>
 <table><tr><th>Service</th><th>Team</th><th>Current state</th><th>Version (env)</th><th>Delivery metrics</th><th>Actions</th></tr>
 {services}</table>
@@ -574,6 +595,29 @@ async function deploySvc(id, name) {{
   call("/api/services/" + id + "/build", {{version: v}}).then(() =>
     call("/api/services/" + id + "/deploy", {{version: v, environment: env}}));
 }}
+
+async function loadPreflight() {{
+  const r = await fetch("/api/preflight"); const v = await r.json();
+  const line = document.getElementById("sysline");
+  const det = document.getElementById("sysdetail");
+  if (v.status === "READY") {{
+    line.innerHTML = "<span style=color:green>● ALL SYSTEMS OK</span> (" + v.total + "/" + v.total + " checks)";
+    document.getElementById("sysstatus").style.borderColor = "green";
+  }} else {{
+    const bad = (v.results || []).filter(x => !x.ok)
+      .map(x => x.check + ": " + x.detail).join(" | ");
+    line.innerHTML = "<span style=color:red>● DEGRADED</span> — " + bad;
+    document.getElementById("sysstatus").style.borderColor = "red";
+  }}
+  det.innerHTML = "<tr><th>Check</th><th>Result</th></tr>" +
+    (v.results || []).map(x =>
+      `<tr><td>${{x.check}}</td><td style="color:${{x.ok ? "green" : "red"}}">${{x.ok ? "PASS" : "FAIL"}} — ${{x.detail}}</td></tr>`).join("");
+}}
+function runPreflight() {{
+  document.getElementById("sysline").textContent = "running checks…";
+  loadPreflight();
+}}
+loadPreflight();
 
 function prompt2(title, label, optionsHtml) {{
   return new Promise(resolve => {{
