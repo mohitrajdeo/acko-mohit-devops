@@ -1,0 +1,10 @@
+# Launchpad starter kit: a local container registry and a webhook receiver.
+# Start:  docker compose up --build
+services:
+  registry:
+    image: registry:2
+    ports: ["5000:5000"]
+  webhook-receiver:
+    build: ./webhook-receiver
+    environment: { PORT: "9000" }
+    ports: ["${WEBHOOK_PORT:-9900}:9000"]  # host port: 9900 by default, override with WEBHOOK_PORT
