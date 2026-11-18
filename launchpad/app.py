@@ -460,6 +460,38 @@ def api_logout():
     return jsonify(ok=True)
 
 
+@app.get("/api/admin/overview")
+def api_admin_overview():
+    """Manager-only: all teams' status + control-plane health in one payload."""
+    u, err = require_user("manager")
+    if err:
+        return err
+    with db() as c:
+        teams = {}
+        for r in c.execute(
+                "SELECT s.name, s.team, d.version, d.environment, d.status "
+                "FROM services s LEFT JOIN deploys d ON d.id = "
+                "(SELECT id FROM deploys WHERE service_id=s.id ORDER BY id DESC LIMIT 1)").fetchall():
+            t = r["team"] or "unassigned"
+            teams.setdefault(t, []).append(
+                {"service": r["name"], "version": r["version"],
+                 "env": r["environment"], "status": r["status"] or "never deployed"})
+        # failed deploys last 24h per team
+        recent = c.execute(
+            "SELECT s.team, COUNT(*) n FROM deploys d JOIN services s ON s.id=d.service_id "
+            "WHERE d.status IN ('failed','rolled_back','rollback_failed') "
+            "AND d.finished_at > datetime('now','-1 day') GROUP BY s.team").fetchall()
+    try:
+        preflight = json.loads((Path(__file__).parent / "preflight.json").read_text())
+    except Exception:
+        preflight = {"status": "UNKNOWN", "failed": None, "total": None}
+    return jsonify(teams=teams,
+                   failures_24h={r["team"]: r["n"] for r in recent},
+                   control_plane=preflight["status"],
+                   control_plane_detail=f"{preflight.get('total', '?') - (preflight.get('failed') or 0)}"
+                                        f"/{preflight.get('total', '?')} checks passed")
+
+
 @app.get("/api/auth/me")
 def api_me():
     u, err = require_user()
@@ -659,40 +691,156 @@ def rows(cursor):
     return "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in cursor)
 
 
+@app.post("/api/admin/seed")
+def api_seed():
+    """One-time setup: team1/team2 demo teams + admin manager account."""
+    with db() as c:
+        c.execute("UPDATE services SET team='team1' WHERE team IN ('platform','qa')")
+        c.execute("UPDATE services SET team='team2' WHERE team IN ('policy')")
+        if not c.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
+            c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
+                      ("admin", hash_pw("admin123"), "", "manager"))
+        for name, team, role in (("team1-lead", "team1", "engineer"),
+                                 ("team2-lead", "team2", "engineer")):
+            if not c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
+                          (name, hash_pw("lead123"), team, role))
+    return jsonify(ok=True, accounts={
+        "admin": {"password": "admin123", "role": "manager"},
+        "team1-lead": {"password": "lead123", "role": "engineer"},
+        "team2-lead": {"password": "lead123", "role": "engineer"}})
+
+
 @app.get("/")
 def ui():
-    with db() as c:
-        svc_rows = c.execute(
-            "SELECT s.name, s.id, s.team, COALESCE(d.version,'—') as version, d.environment, d.status "
-            "FROM services s LEFT JOIN deploys d ON d.id = "
-            "(SELECT id FROM deploys WHERE service_id=s.id ORDER BY id DESC LIMIT 1)"
-        ).fetchall()
-        ev_rows = c.execute("SELECT created_at,type,detail FROM events ORDER BY id DESC LIMIT 15").fetchall()
-        metrics = {r["service"]: r for r in _metrics_rows(c)}
-    teams = sorted({r["team"] for r in svc_rows if r["team"]})
-    svc_table = ""
-    for r in svc_rows:
-        m = metrics.get(r["name"], {})
-        dep_n = m.get("deploys_total", 0)
-        fail = m.get("deploy_failure_pct", 0.0)
-        mttr = m.get("mttr_minutes")
-        mttr_s = f"{mttr} min" if mttr is not None else "—"
-        status = r["status"] or "never deployed"
-        svc_table += (
-            f"<tr><td>{r['name']}</td><td>{r['team'] or '—'}</td>"
-            f"<td>{status}</td>"
-            f"<td>{r['version']} ({r['environment'] or '—'})</td>"
-            f"<td>{dep_n} deploys · {fail}% failed · MTTR {mttr_s}</td>"
-            f"<td class=actions>"
-            f"<button onclick=deploySvc({r['id']},'{r['name']}')>Deploy</button> "
-            f"<button onclick=promoteSvc({r['id']})>Promote→prod</button> "
-            f"<button onclick=rollbackSvc('{r['name']}',{r['id']})>Rollback</button></td></tr>")
-    ev_table = "".join(
-        f"<tr><td>{r['created_at']}</td><td><b>{r['type']}</b></td>"
-        f"<td>{str(r['detail'])[:90]}</td></tr>"
-        for r in ev_rows)
-    team_opts = "".join(f'<option value="{t}">{t}</option>' for t in teams)
-    return PAGE.format(services=svc_table, events=ev_table, teams=team_opts)
+    return LOGIN_PAGE
+
+
+@app.get("/admin")
+def admin_ui():
+    return ADMIN_PAGE
+
+
+@app.get("/dashboard")
+def dashboard_ui():
+    return DASH_PAGE
+
+
+LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — sign in</title><style>
+body{font-family:system-ui,sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{background:#fff;padding:30px 36px;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:300px}
+h1{color:#1a3c6e;font-size:22px;margin:0 0 6px} .lead{color:#666;font-size:13px;margin-bottom:18px}
+input,select{width:100%;padding:9px;margin:6px 0;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+button{width:100%;padding:10px;background:#1a3c6e;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px}
+#msg{font-size:13px;margin-top:10px;min-height:16px}
+</style></head><body><div class=box>
+<h1>Launchpad</h1><p class=lead>Sign in to your team's view. No session = shared view (read-only).</p>
+<input id=u placeholder=username><input id=p type=password placeholder=password>
+<button onclick=doLogin()>Sign in</button><div id=msg></div>
+<script>
+async function doLogin(){
+  const r = await fetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({username:u.value,password:p.value})});
+  const j = await r.json();
+  if(!r.ok){ msg.textContent=j.error||"login failed"; msg.style.color="red"; return; }
+  localStorage.setItem("lp_session",j.token); localStorage.setItem("lp_role",j.role);
+  location.href = j.role==="manager" ? "/admin" : "/dashboard";
+}
+</script></div></body></html>"""
+
+
+DASH_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — team view</title><style>
+body{font-family:system-ui,sans-serif;margin:20px;background:#fafafa}
+h1{color:#1a3c6e} table{border-collapse:collapse;width:100%;background:#fff;margin-bottom:24px}
+td,th{border:1px solid #d8d8d8;padding:6px 10px;text-align:left;font-size:14px}
+th{background:#eef2f7} .top{display:flex;justify-content:space-between;align-items:center}
+button{padding:4px 10px;cursor:pointer} .lead{color:#555;font-size:13px}
+</style></head><body>
+<div class=top><h1>Launchpad — team view</h1><div><span id=who></span>
+<button onclick='location.href="/"'>Switch user</button></div></div>
+<div id=status style="padding:8px 12px;margin:10px 0;border:1px solid #ccc;background:#fff"></div>
+<h2>Your team's services</h2>
+<table><tr><th>Service</th><th>State</th><th>Version (env)</th><th>Actions</th></tr>
+<tbody id=svcs></tbody></table>
+<h2>Recent events (your team)</h2>
+<table><tr><th>At</th><th>Event</th><th>Detail</th></tr><tbody id=evs></tbody></table>
+<script>
+const S = localStorage.getItem("lp_session");
+const H = {"X-Session": S};
+async function load(){
+  const me = await (await fetch("/api/auth/me",{headers:H})).json();
+  who.textContent = me.username + " (" + me.role + ", " + me.team + ")";
+  const p = await (await fetch("/api/preflight",{headers:H})).json();
+  status.innerHTML = p.status==="READY"
+    ? "<b style=color:green>Control plane: ALL OK</b> ("+p.total+"/"+p.total+")"
+    : "<b style=color:red>Control plane: DEGRADED</b> — " + p.failed + " failing";
+  const ds = await (await fetch("/api/deploys",{headers:H})).json();
+  const seen = {};
+  svcs.innerHTML = ds.filter(d=>!seen[d.service]++).map(d =>
+    `<tr><td>${d.service}</td><td>${d.status}</td><td>${d.version} (${d.environment})</td>
+     <td><button onclick=rb('${d.service}',${d.id})>Rollback</button></td></tr>`).join("")
+    || "<tr><td colspan=4>no deploys visible for your team</td></tr>";
+  const ev = await (await fetch("/api/events",{headers:H})).json();
+  evs.innerHTML = ev.slice(0,12).map(e =>
+    `<tr><td>${e.created_at}</td><td><b>${e.type}</b></td><td>${String(e.detail).slice(0,80)}</td></tr>`).join("");
+}
+async function rb(name, did){
+  const v = prompt("Roll back "+name+" to version (e.g. v1.1.0):");
+  if(!v) return;
+  await fetch("/api/deploys/"+did+"/rollback",{method:"POST",headers:{...H,"Content-Type":"application/json"},body:JSON.stringify({version:v})});
+  load();
+}
+load();
+</script></body></html>"""
+
+
+ADMIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — admin</title><style>
+body{font-family:system-ui,sans-serif;margin:20px;background:#fafafa}
+h1,h2{color:#1a3c6e} table{border-collapse:collapse;width:100%;background:#fff;margin-bottom:24px}
+td,th{border:1px solid #d8d8d8;padding:6px 10px;text-align:left;font-size:14px}
+th{background:#eef2f7} .top{display:flex;justify-content:space-between;align-items:center}
+.ok{color:green;font-weight:bold} .bad{color:red;font-weight:bold}
+.grid{display:flex;gap:20px;flex-wrap:wrap}.card{background:#fff;border:1px solid #d8d8d8;border-radius:8px;padding:14px 18px;min-width:260px}
+button{padding:4px 10px;cursor:pointer}
+</style></head><body>
+<div class=top><h1>Launchpad — admin console</h1><div><span id=who></span>
+<button onclick='location.href="/"'>Switch user</button>
+<button onclick=runPreflight()>Re-run control-plane checks</button></div></div>
+<div class=grid>
+<div class=card><h2>Control plane</h2><div id=cp>checking…</div></div>
+<div class=card><h2>Failures (24h)</h2><div id=fails></div></div>
+</div>
+<h2>All teams — what's running where</h2>
+<table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th></tr>
+<tbody id=rows></tbody></table>
+<script>
+const S = localStorage.getItem("lp_session");
+const H = {"X-Session": S};
+async function load(){
+  const me = await (await fetch("/api/auth/me",{headers:H})).json();
+  who.textContent = me.username + " (manager)";
+  const o = await (await fetch("/api/admin/overview",{headers:H})).json();
+  cp.innerHTML = o.control_plane==="READY"
+    ? "<span class=ok>● READY</span> — " + o.control_plane_detail
+    : "<span class=bad>● " + o.control_plane + "</span> — " + o.control_plane_detail;
+  fails.innerHTML = Object.keys(o.failures_24h||{}).length
+    ? Object.entries(o.failures_24h).map(([t,n])=>`${t}: <span class=bad>${n}</span>`).join("<br>")
+    : "<span class=ok>none</span>";
+  let html = "";
+  for (const [team, svcs] of Object.entries(o.teams||{}))
+    for (const s of svcs)
+      html += `<tr><td><b>${team}</b></td><td>${s.service}</td>
+        <td style="color:${s.status==='healthy'?'green':'#b35400'}">${s.status}</td>
+        <td>${s.version} (${s.env})</td></tr>`;
+  rows.innerHTML = html;
+}
+async function runPreflight(){
+  cp.textContent = "running checks…";
+  await (await fetch("/api/preflight",{headers:H})).json();
+  load();
+}
+load();
+</script></body></html>"""
 
 
 def _metrics_rows(c):
