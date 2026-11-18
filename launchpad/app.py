@@ -190,7 +190,9 @@ def deploy(service_id, version, environment):
         run(f"docker rm -f {tmp} 2>/dev/null")
         if old_existed:
             run(f"docker start {container}")
-            _finish_deploy(deploy_id, "rolled_back", "restored previous running version")
+            prev = last_good_version(service_id, environment, deploy_id)
+            _finish_deploy(deploy_id, "rolled_back", "restored previous running version",
+                           effective_version=prev)
             log_event(deploy_id, "rollback.auto", "restored previous running version")
         else:
             _finish_deploy(deploy_id, "failed", "health gate failed, no previous version")
@@ -198,10 +200,14 @@ def deploy(service_id, version, environment):
     return deploy_id
 
 
-def _finish_deploy(deploy_id, status, detail):
+def _finish_deploy(deploy_id, status, detail, effective_version=None):
     with db() as c:
         c.execute("UPDATE deploys SET status=?, detail=?, finished_at=? WHERE id=?",
                   (status, detail, now(), deploy_id))
+        if effective_version:
+            # for rollbacks: the version actually running after recovery
+            c.execute("UPDATE deploys SET version=? WHERE id=?",
+                      (effective_version, deploy_id))
     log_event(deploy_id, f"deploy.{status}", detail)
 
 
@@ -232,7 +238,8 @@ def _auto_rollback(svc, failed_deploy_id, environment):
             f"-p {host_port}:{svc['port']} localhost:5000/{svc['name']}:{good}")
     ok = r.returncode == 0
     _finish_deploy(failed_deploy_id, "rolled_back" if ok else "rollback_failed",
-                   f"recovered to {good}" if ok else r.stderr)
+                   f"recovered to {good}" if ok else r.stderr,
+                   effective_version=good if ok else None)
     if ok:
         # record the recovery as its own healthy deploy
         with db() as c:
@@ -302,6 +309,13 @@ def api_rollback(did):
     log_event(did, "rollback.manual", f"to {good}")
     deploy(svc["id"], good, d["environment"])
     return jsonify(ok=True, version=good)
+
+
+@app.get("/api/services")
+def api_list_services():
+    with db() as c:
+        rows = c.execute("SELECT * FROM services ORDER BY id").fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 @app.get("/api/deploys")

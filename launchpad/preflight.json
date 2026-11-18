@@ -1,6 +1,6 @@
 {
-  "at": "2026-11-18T14:01:31",
-  "total": 11,
+  "at": "2026-11-18T14:07:57",
+  "total": 13,
   "failed": 0,
   "results": [
     {
@@ -37,6 +37,16 @@
       "check": "database writable",
       "ok": true,
       "detail": "db writable"
+    },
+    {
+      "check": "staging port for service 3",
+      "ok": true,
+      "detail": "port 8103 in use by managed container lp-acceptance-svc-staging (expected)"
+    },
+    {
+      "check": "prod port for service 3",
+      "ok": true,
+      "detail": "port 8203 free"
     },
     {
       "check": "staging port for service 2",
