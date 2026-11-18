@@ -469,23 +469,18 @@ def ui():
         fail = m.get("deploy_failure_pct", 0.0)
         mttr = m.get("mttr_minutes")
         mttr_s = f"{mttr} min" if mttr is not None else "—"
-        badge = {"healthy": "🟢", "failed": "🔴", "rolled_back": "🟠",
-                 "rollback_failed": "🔴", "rejected": "🟠"}.get(r["status"], "⚪")
+        status = r["status"] or "never deployed"
         svc_table += (
             f"<tr><td>{r['name']}</td><td>{r['team'] or '—'}</td>"
-            f"<td>{badge} {r['status'] or 'never deployed'}</td>"
+            f"<td>{status}</td>"
             f"<td>{r['version']} ({r['environment'] or '—'})</td>"
             f"<td>{dep_n} deploys · {fail}% failed · MTTR {mttr_s}</td>"
             f"<td class=actions>"
             f"<button onclick=deploySvc({r['id']},'{r['name']}')>Deploy</button> "
             f"<button onclick=promoteSvc({r['id']})>Promote→prod</button> "
             f"<button onclick=rollbackSvc('{r['name']}',{r['id']})>Rollback</button></td></tr>")
-    icon = {"deploy.started": "🚀", "deploy.healthy": "✅", "deploy.failed": "❌",
-            "health.retry": "⏳", "health.gate_failed": "⚠️", "rollback.auto": "↩️",
-            "rollback.manual": "↩️", "deploy.rolled_back": "🟠", "config.set": "⚙️",
-            "service.registered": "📋", "deploy.rejected": "🚫"}
     ev_table = "".join(
-        f"<tr><td>{r['created_at']}</td><td>{icon.get(r['type'],'•')} <b>{r['type']}</b></td>"
+        f"<tr><td>{r['created_at']}</td><td><b>{r['type']}</b></td>"
         f"<td>{str(r['detail'])[:90]}</td></tr>"
         for r in ev_rows)
     team_opts = "".join(f'<option value="{t}">{t}</option>' for t in teams)
@@ -529,7 +524,7 @@ td,th{{border:1px solid #d8d8d8;padding:7px 10px;text-align:left;font-size:14px}
 th{{background:#eef2f7}} .actions button{{margin:2px;padding:4px 10px;cursor:pointer}}
 .lead{{color:#555}} code{{background:#eef;padding:1px 4px}}
 </style></head><body>
-<h1>🚀 Launchpad</h1>
+<h1>Launchpad</h1>
 <p class=lead>Deploy a version, check it is healthy, roll back in one click if it isn't.
 Every action announces itself on the webhook — no silent failures.</p>
 <h2>Services — what's running where</h2>
@@ -538,7 +533,7 @@ Every action announces itself on the webhook — no silent failures.</p>
 <h2>Recent events</h2>
 <p class=lead>Filter: <select onchange="location.href='/?team='+this.value">
 <option value="">All teams</option>{teams}</select>
-<span class=lead> · every event announces itself — 🚀 deploy ✅ healthy ❌ failed ⚠️ gate ↩️ rollback 🚫 rejected</span></p>
+<span class=lead> · every event announces itself, no silent failures</span></p>
 <table><tr><th>At</th><th>Event</th><th>Detail</th></tr>{events}</table>
 <script>
 async function call(url, body) {{
