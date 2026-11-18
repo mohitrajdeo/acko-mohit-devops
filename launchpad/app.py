@@ -699,16 +699,16 @@ def api_seed():
         c.execute("UPDATE services SET team='team2' WHERE team IN ('policy')")
         if not c.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
             c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
-                      ("admin", hash_pw("admin123"), "", "manager"))
-        for name, team, role in (("team1-lead", "team1", "engineer"),
-                                 ("team2-lead", "team2", "engineer")):
+                      ("admin", hash_pw("1234"), "", "manager"))
+        for name, team, role in (("team1", "team1", "engineer"),
+                                 ("team2", "team2", "engineer")):
             if not c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
                 c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
-                          (name, hash_pw("lead123"), team, role))
+                          (name, hash_pw("1234"), team, role))
     return jsonify(ok=True, accounts={
-        "admin": {"password": "admin123", "role": "manager"},
-        "team1-lead": {"password": "lead123", "role": "engineer"},
-        "team2-lead": {"password": "lead123", "role": "engineer"}})
+        "admin": {"password": "1234", "role": "manager"},
+        "team1": {"password": "1234", "role": "engineer"},
+        "team2": {"password": "1234", "role": "engineer"}})
 
 
 @app.get("/")
