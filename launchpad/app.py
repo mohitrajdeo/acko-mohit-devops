@@ -92,10 +92,25 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
-def notify(event_type, detail):
-    """Announce everything — no silent failures (DECISIONS.md)."""
-    body = json.dumps({"source": "launchpad", "type": event_type,
-                       "detail": detail, "at": now()}).encode()
+SEVERITY = {
+    "deploy.started": "info", "deploy.healthy": "info", "service.registered": "info",
+    "config.set": "info", "user.login": "info", "user.registered": "info",
+    "health.retry": "warning", "deploy.rejected": "warning",
+    "health.gate_failed": "alert", "health.failure_stage": "alert",
+    "deploy.failed": "alert", "rollback.auto": "alert",
+    "rollback.manual": "alert", "deploy.rolled_back": "alert",
+    "deploy.rollback_failed": "alert",
+}
+
+
+def notify(event_type, detail, extra=None):
+    """Announce everything — no silent failures (DECISIONS.md).
+    Structured payload: severity lets a real chat router pick channels."""
+    body = json.dumps({
+        "source": "launchpad", "type": event_type,
+        "severity": SEVERITY.get(event_type, "info"),
+        "detail": detail, "at": now(), **(extra or {}),
+    }).encode()
     try:
         req = urllib.request.Request(WEBHOOK_URL, data=body,
                                      headers={"Content-Type": "application/json"})
@@ -104,11 +119,20 @@ def notify(event_type, detail):
         print(f"[webhook] unreachable: {e}")
 
 
-def log_event(deploy_id, event_type, detail):
+def log_event(deploy_id, event_type, detail, extra=None):
     with db() as c:
         c.execute("INSERT INTO events(deploy_id,type,detail,created_at) VALUES(?,?,?,?)",
                   (deploy_id, event_type, detail, now()))
-    notify(event_type, detail)
+        ctx = {}
+        if deploy_id:
+            d = c.execute(
+                "SELECT d.version, d.environment, s.name FROM deploys d "
+                "JOIN services s ON s.id=d.service_id WHERE d.id=?",
+                (deploy_id,)).fetchone()
+            if d:
+                ctx = {"service": d["name"], "version": d["version"],
+                       "environment": d["environment"]}
+    notify(event_type, detail, {**ctx, **(extra or {})})
 
 
 def run(cmd, **kw):
@@ -617,15 +641,14 @@ def api_metrics():
                                 mttrs.append(gap)
                             break
             # avg build duration
-            builds = c.execute(
-                "SELECT started, finished FROM build_timings WHERE service_id=?",
-                (svc["id"],)).fetchall() if False else []
+            lead = _lead_time_to_prod(c, svc["id"])
             out.append({
                 "service": svc["name"],
                 "deploys_total": total,
                 "deploys_per_day": round(total / days, 1),
                 "deploy_failure_pct": round(100 * failed / total, 1) if total else 0.0,
                 "mttr_minutes": round(sum(mttrs) / len(mttrs), 1) if mttrs else None,
+                "lead_time_to_prod_minutes": lead,
                 "last_status": deploys[-1]["status"] if deploys else None,
             })
     return jsonify(out)
@@ -644,6 +667,23 @@ def _days_span(timestamps):
         return max(1, round((b - a).total_seconds() / 86400, 2))
     except ValueError:
         return 1
+
+
+def _lead_time_to_prod(c, service_id):
+    """Median minutes from a version's first staging deploy to its first prod deploy."""
+    import statistics
+    rows = c.execute(
+        "SELECT version, environment, started_at FROM deploys "
+        "WHERE service_id=? AND started_at IS NOT NULL ORDER BY id", (service_id,)).fetchall()
+    stg, prod = {}, {}
+    for r in rows:
+        if r["environment"] == "staging" and r["version"] not in stg:
+            stg[r["version"]] = r["started_at"]
+        if r["environment"] == "prod" and r["version"] not in prod:
+            prod[r["version"]] = r["started_at"]
+    gaps = [_minutes_between(stg[v], prod[v]) for v in prod if v in stg]
+    gaps = [g for g in gaps if g is not None]
+    return round(statistics.median(gaps), 1) if gaps else None
 
 
 def _minutes_between(a, b):
