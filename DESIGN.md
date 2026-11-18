@@ -132,8 +132,21 @@ Per service, computed from real history:
 4. Deploy **broken** v1.2.0 to prod → probes fail → **auto-rollback** restores v1.0.0
    → full event story on the webhook page, MTTR recorded in metrics
 5. Fire two deploys for the same service+env simultaneously → second is
-   **rejected** (concurrency guard), first completes cleanly
+   **queued** (deploy queue, waits its turn with queued/dequeued events)
+   rather than rejected; completes cleanly
 6. One-click manual rollback from the dashboard to any healthy version
+   (dropdown of healthy versions only, no confirmation popup)
+7. **Stop a running container** → watchdog detects it within 60s →
+   one-time `service.down` **alert** webhook
+8. **`/envs` page**: staging vs prod of the same service side by side —
+   env mode, version, commit hash (`git rev-parse`), ports (staging
+   8100+id / prod 8200+id) — plus the live git diff between the versions
+   each environment runs (physical proof of what a version change contains)
+9. **`/diff` page**: pick any two versions → commits between them, files
+   changed, full colorized git diff
+10. Manager console (`/admin`): live **CPU/RAM/disk** bars of the control
+    plane, failures/24h + delivery metrics as bar graphs, per-team cards,
+    separate **Deploy to staging** / **Push to production** buttons
 
 ## 10. Known limits / next steps (also in DECISIONS.md)
 

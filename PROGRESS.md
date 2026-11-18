@@ -110,9 +110,53 @@ entries below are logged as they happened on build day.
   can route alerts vs feed. (User: "make the webhook receiver good.")
 - **14:45 — e2e re-run: 15/15 ALL GREEN.**
 
+## Session 11 — manager console v2 (monitor multiple teams + the control plane)
+
+- **14:50 — Control-plane resource monitor** (`/api/system/resources`): live CPU,
+  RAM, disk from `/proc`, as bar graphs in an admin card — manager sees when the
+  control plane itself needs more resources. Live: CPU 0.2% (16 cores), RAM 12% of
+  7.6 GB, disk 1.6% used.
+- **14:55 — Delivery metrics + failures as bar graphs** in the admin console
+  (per service: failure %, deploys/day, MTTR, lead time; per team: failures/24h).
+- **15:00 — Post-deploy watchdog**: checks every running container every 60s;
+  fires a one-time `service.down` alert event + webhook when something dies.
+  Live-proven: stopped lp-acceptance-svc-prod → alert fired.
+- **15:05 — Deploy queue**: a concurrent deploy now WAITS (queued/dequeued events)
+  instead of being rejected; times out after 180s. Live: second deploy waited 16s
+  then proceeded.
+- **15:10 — Admin state correctness**: overview reads the `pointers` table per
+  (service × environment) with a latest-deploy fallback — no more blank "never
+  deployed" rows for services predating the pointer table.
+
+## Session 12 — correctness hardening + demo pieces
+
+- **15:15 — Build pipeline fail-fast**: a failed `git checkout` aborts the build —
+  a nonexistent tag can never produce a mistagged image (root-caused after v1.4.0
+  built wrong code silently). e2e re-run: 15/15 ALL GREEN.
+- **15:20 — Demo versions**: tags v1.3.0/v1.4.0 added (git refs only, no kit code
+  changes); built + gated on acceptance-svc — rollback dropdown now offers
+  v1.4.0 / v1.3.0 / v1.1.0.
+- **15:25 — One-click rollback**: dashboard rollback shows a dropdown of healthy
+  versions (no typing, no confirm popup); admin rollback is one click.
+- **15:30 — Version diff viewer** (`/diff` page + `/api/services/<id>/diff`):
+  real git diff between two versions — commits between, files changed, full
+  colorized diff as physical proof of what changed.
+
+## Session 13 — push-to-production story
+
+- **15:35 — Admin actions split**: separate "Deploy to staging" and "Push to
+  production" buttons per service row. Push-to-prod promotes the staging-healthy
+  version through the prod gate — nothing reaches prod unverified.
+- **15:40 — `/envs` page**: staging vs production side by side for the same
+  service — env mode, version, commit hash (`git rev-parse`), ports
+  (staging 8100+id / prod 8200+id), and the live git diff between the two
+  running versions. Live state: staging v1.3.0 (8103), prod v1.1.0 (8203),
+  commit `ed9437fb7ef3`.
+- **15:45 — e2e re-run after all changes: 15/15 ALL GREEN.**
+
 ## Submission status
 
-- ✅ Code + 24 incremental commits
+- ✅ Code + 30+ incremental commits
 - ✅ README.md (complete per PDF: run-from-scratch, pages, API, honest limits)
 - ✅ PLAN.md (frozen post-Gate-1), DECISIONS.md, DESIGN.md, COVERAGE.md, STATUS.md
 - ✅ Tests: preflight (13 checks) + e2e (15/15)

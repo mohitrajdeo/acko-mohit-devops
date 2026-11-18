@@ -140,8 +140,10 @@ Works: everything in the feature list above, proven live against the starter kit
 (quote-svc, policy-svc, their 3 tags each, broken versions detected and rolled back).
 
 Not built (out of scope or future work):
-- Kubernetes deployment target, canary releases, deploy queue at fleet scale
-- Periodic post-deploy health re-checks (gate is deploy-time only)
+- Kubernetes deployment target, canary releases (deploy queue at fleet scale — a
+  simple per-service queue exists now)
+- Periodic post-deploy health re-checks — partially covered: a watchdog checks all
+  running containers every 60s and alerts `service.down` (no auto-action)
 - Password reset / session expiry beyond logout (demo-grade auth)
 - UI polish beyond functional (tokens went to the engine)
 
@@ -154,8 +156,30 @@ Not built (out of scope or future work):
   (service × environment); dashboards read it, so state stays correct after rollbacks.
 - **Snapshots over live config:** each deploy stores its env vars; rollback restores
   the deploy-time snapshot, immune to later config rotation.
-- **Immutable versions:** builds come from pristine `checkout -f` tag states; the
-  registry stores each version permanently — "what is running" is always verifiable.
+- **Immutable versions:** builds come from pristine `checkout -f` tag states and
+  abort at the first failing step (a bad tag can never push a mistagged image);
+  the registry stores each version permanently — "what is running" is always
+  verifiable, provable via the `/diff` page (git diff + commit hash between any
+  two versions).
+
+## Extras beyond the must-haves
+
+- **Manager console** (`/admin`): all teams, control-plane health (13-check
+  preflight), **live resource monitor** (CPU/RAM/disk bars — see when the control
+  plane itself needs more capacity), failures/24h graph, delivery metrics graphs,
+  per-team cards (last 5 deploys + events), one-click **Deploy to staging** /
+  **Push to production** buttons.
+- **Watchdog**: every running container checked every 60s; a death fires a
+  one-time `service.down` alert webhook (no spam).
+- **Deploy queue**: concurrent deploys for the same (service × env) wait their
+  turn (queued/dequeued events) instead of being rejected.
+- **`/envs` page**: staging vs production of the same service side by side —
+  env mode, version, commit hash, ports — with the live git diff between what
+  each environment runs.
+- **`/diff` page**: physical proof of what changed between any two versions
+  (commits, files, full colorized git diff).
+- **Structured webhooks**: severity tiers (info/warning/alert) + service/version/
+  environment context on every event.
 
 ## Layout
 
