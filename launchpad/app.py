@@ -45,11 +45,16 @@ def db():
 
 
 def init_db():
+    # migration: add team column to pre-existing databases
+    with db() as c:
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(services)").fetchall()]
+        if "team" not in cols:
+            c.execute("ALTER TABLE services ADD COLUMN team TEXT DEFAULT ''")
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS services(
             id INTEGER PRIMARY KEY, name TEXT UNIQUE, repo_path TEXT,
-            dockerfile TEXT, port INTEGER, health_path TEXT);
+            dockerfile TEXT, port INTEGER, health_path TEXT, team TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS builds(
             id INTEGER PRIMARY KEY, service_id INTEGER, version TEXT,
             status TEXT, log TEXT, created_at TEXT);
@@ -248,10 +253,11 @@ def _get_env_vars(service_id, environment):
 def api_register():
     b = request.json or {}
     with db() as c:
-        cur = c.execute("INSERT INTO services(name,repo_path,dockerfile,port,health_path) "
-                        "VALUES(?,?,?,?,?)",
+        cur = c.execute("INSERT INTO services(name,repo_path,dockerfile,port,health_path,team) "
+                        "VALUES(?,?,?,?,?,?)",
                         (b["name"], b["repo_path"], b.get("dockerfile", "Dockerfile"),
-                         b.get("port", 8080), b.get("health_path", "/health")))
+                         b.get("port", 8080), b.get("health_path", "/health"),
+                         b.get("team", "")))
     notify("service.registered", b["name"])
     return jsonify(id=cur.lastrowid)
 
@@ -302,7 +308,7 @@ def api_rollback(did):
 def api_deploys():
     with db() as c:
         rows = c.execute(
-            "SELECT d.*, s.name as service FROM deploys d JOIN services s "
+            "SELECT d.*, s.name as service, s.team FROM deploys d JOIN services s "
             "ON s.id=d.service_id ORDER BY d.id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -415,8 +421,18 @@ def _minutes_between(a, b):
 
 @app.get("/api/events")
 def api_events():
+    team = request.args.get("team", "")
+    svc = request.args.get("service", "")
     with db() as c:
-        rows = c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100").fetchall()
+        if team or svc:
+            rows = c.execute(
+                "SELECT e.* FROM events e LEFT JOIN deploys d ON e.deploy_id=d.id "
+                "LEFT JOIN services s ON d.service_id=s.id "
+                "WHERE (e.deploy_id IS NULL OR (?='' OR s.team=?) AND (?='' OR s.name=?)) "
+                "ORDER BY e.id DESC LIMIT 100",
+                (team, team, svc, svc)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -439,12 +455,13 @@ def rows(cursor):
 def ui():
     with db() as c:
         svc_rows = c.execute(
-            "SELECT s.name, s.id, COALESCE(d.version,'—') as version, d.environment, d.status "
+            "SELECT s.name, s.id, s.team, COALESCE(d.version,'—') as version, d.environment, d.status "
             "FROM services s LEFT JOIN deploys d ON d.id = "
             "(SELECT id FROM deploys WHERE service_id=s.id ORDER BY id DESC LIMIT 1)"
         ).fetchall()
         ev_rows = c.execute("SELECT created_at,type,detail FROM events ORDER BY id DESC LIMIT 15").fetchall()
         metrics = {r["service"]: r for r in _metrics_rows(c)}
+    teams = sorted({r["team"] for r in svc_rows if r["team"]})
     svc_table = ""
     for r in svc_rows:
         m = metrics.get(r["name"], {})
@@ -455,17 +472,24 @@ def ui():
         badge = {"healthy": "🟢", "failed": "🔴", "rolled_back": "🟠",
                  "rollback_failed": "🔴", "rejected": "🟠"}.get(r["status"], "⚪")
         svc_table += (
-            f"<tr><td>{r['name']}</td><td>{badge} {r['status'] or 'never deployed'}</td>"
+            f"<tr><td>{r['name']}</td><td>{r['team'] or '—'}</td>"
+            f"<td>{badge} {r['status'] or 'never deployed'}</td>"
             f"<td>{r['version']} ({r['environment'] or '—'})</td>"
             f"<td>{dep_n} deploys · {fail}% failed · MTTR {mttr_s}</td>"
             f"<td class=actions>"
             f"<button onclick=deploySvc({r['id']},'{r['name']}')>Deploy</button> "
             f"<button onclick=promoteSvc({r['id']})>Promote→prod</button> "
             f"<button onclick=rollbackSvc('{r['name']}',{r['id']})>Rollback</button></td></tr>")
+    icon = {"deploy.started": "🚀", "deploy.healthy": "✅", "deploy.failed": "❌",
+            "health.retry": "⏳", "health.gate_failed": "⚠️", "rollback.auto": "↩️",
+            "rollback.manual": "↩️", "deploy.rolled_back": "🟠", "config.set": "⚙️",
+            "service.registered": "📋", "deploy.rejected": "🚫"}
     ev_table = "".join(
-        f"<tr><td>{r['created_at']}</td><td><b>{r['type']}</b></td><td>{str(r['detail'])[:90]}</td></tr>"
+        f"<tr><td>{r['created_at']}</td><td>{icon.get(r['type'],'•')} <b>{r['type']}</b></td>"
+        f"<td>{str(r['detail'])[:90]}</td></tr>"
         for r in ev_rows)
-    return PAGE.format(services=svc_table, events=ev_table)
+    team_opts = "".join(f'<option value="{t}">{t}</option>' for t in teams)
+    return PAGE.format(services=svc_table, events=ev_table, teams=team_opts)
 
 
 def _metrics_rows(c):
@@ -509,9 +533,12 @@ th{{background:#eef2f7}} .actions button{{margin:2px;padding:4px 10px;cursor:poi
 <p class=lead>Deploy a version, check it is healthy, roll back in one click if it isn't.
 Every action announces itself on the webhook — no silent failures.</p>
 <h2>Services — what's running where</h2>
-<table><tr><th>Service</th><th>Current state</th><th>Version (env)</th><th>Delivery metrics</th><th>Actions</th></tr>
+<table><tr><th>Service</th><th>Team</th><th>Current state</th><th>Version (env)</th><th>Delivery metrics</th><th>Actions</th></tr>
 {services}</table>
 <h2>Recent events</h2>
+<p class=lead>Filter: <select onchange="location.href='/?team='+this.value">
+<option value="">All teams</option>{teams}</select>
+<span class=lead> · every event announces itself — 🚀 deploy ✅ healthy ❌ failed ⚠️ gate ↩️ rollback 🚫 rejected</span></p>
 <table><tr><th>At</th><th>Event</th><th>Detail</th></tr>{events}</table>
 <script>
 async function call(url, body) {{
