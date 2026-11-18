@@ -57,6 +57,12 @@ def init_db():
         if "failure_stage" not in dcols:
             c.execute("ALTER TABLE deploys ADD COLUMN failure_stage TEXT DEFAULT ''")
     with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY, username TEXT UNIQUE,
+            password_hash TEXT, team TEXT, role TEXT)""")  # role: engineer|manager
+        c.execute("""CREATE TABLE IF NOT EXISTS sessions(
+            token TEXT PRIMARY KEY, user_id INTEGER, created_at TEXT)""")
+    with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS services(
             id INTEGER PRIMARY KEY, name TEXT UNIQUE, repo_path TEXT,
@@ -108,6 +114,51 @@ def log_event(deploy_id, event_type, detail):
 def run(cmd, **kw):
     return subprocess.run(cmd, shell=isinstance(cmd, str),
                           capture_output=True, text=True, **kw)
+
+
+# ---------------------------------------------------------------- auth (stdlib hash)
+import hashlib
+import secrets
+
+
+def hash_pw(pw, salt=None):
+    salt = salt or secrets.token_hex(8)
+    return f"{salt}${hashlib.sha256((salt + pw).encode()).hexdigest()}"
+
+
+def verify_pw(pw, stored):
+    try:
+        salt, _ = stored.split("$", 1)
+        return secrets.compare_digest(hash_pw(pw, salt), stored)
+    except (ValueError, AttributeError):
+        return False
+
+
+def current_user():
+    """Session token -> user row (None if logged out)."""
+    token = request.headers.get("X-Session") or request.args.get("session", "")
+    if not token:
+        return None
+    with db() as c:
+        return c.execute(
+            "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
+            (token,)).fetchone()
+
+
+def require_user(min_role=None):
+    u = current_user()
+    if not u:
+        return None, (jsonify(error="login required"), 401)
+    if min_role == "manager" and u["role"] != "manager":
+        return None, (jsonify(error="manager role required"), 403)
+    return u, None
+
+
+def team_scope(u):
+    """SQL clause for team filtering: manager sees all, engineer sees own team."""
+    if u["role"] == "manager" or not u["team"]:
+        return "", ()
+    return " AND s.team=?", (u["team"],)
 
 
 # ---------------------------------------------------------------- builds
@@ -367,6 +418,56 @@ def api_rollback(did):
     return jsonify(ok=True, version=good)
 
 
+@app.post("/api/auth/register")
+def api_register_user():
+    """First user becomes manager automatically; after that, only managers add users."""
+    b = request.json or {}
+    with db() as c:
+        count = c.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        role = "manager" if count == 0 else "engineer"
+        if count > 0:
+            u, err = require_user("manager")
+            if err:
+                return err
+            if (b.get("role") or "engineer") == "manager":
+                role = "manager"
+        cur = c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
+                        (b["username"], hash_pw(b["password"]),
+                         b.get("team", ""), role))
+    notify("user.registered", f"{b['username']} ({role}, {b.get('team', 'no team')})")
+    return jsonify(id=cur.lastrowid, role=role)
+
+
+@app.post("/api/auth/login")
+def api_login():
+    b = request.json or {}
+    with db() as c:
+        u = c.execute("SELECT * FROM users WHERE username=?", (b.get("username"),)).fetchone()
+        if not u or not verify_pw(b.get("password", ""), u["password_hash"]):
+            return jsonify(error="invalid credentials"), 401
+        token = secrets.token_hex(16)
+        c.execute("INSERT INTO sessions(token,user_id,created_at) VALUES(?,?,?)",
+                  (token, u["id"], now()))
+    notify("user.login", u["username"])
+    return jsonify(token=token, role=u["role"], team=u["team"], username=u["username"])
+
+
+@app.post("/api/auth/logout")
+def api_logout():
+    token = request.headers.get("X-Session", "")
+    with db() as c:
+        c.execute("DELETE FROM sessions WHERE token=?", (token,))
+    return jsonify(ok=True)
+
+
+@app.get("/api/auth/me")
+def api_me():
+    u, err = require_user()
+    if err:
+        return err
+    return jsonify(username=u["username"], role=u["role"], team=u["team"])
+
+
 @app.get("/api/services")
 def api_list_services():
     with db() as c:
@@ -376,10 +477,12 @@ def api_list_services():
 
 @app.get("/api/deploys")
 def api_deploys():
+    u, err = require_user()
+    scope, args = ("", ()) if u is None else team_scope(u)
     with db() as c:
         rows = c.execute(
             "SELECT d.*, s.name as service, s.team FROM deploys d JOIN services s "
-            "ON s.id=d.service_id ORDER BY d.id DESC").fetchall()
+            "ON s.id=d.service_id WHERE 1=1" + scope + " ORDER BY d.id DESC", args).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -525,14 +628,17 @@ def _minutes_between(a, b):
 def api_events():
     team = request.args.get("team", "")
     svc = request.args.get("service", "")
+    u, err = require_user()          # a session narrows scope to the user's team
+    scoped = u is not None and u["role"] != "manager"
     with db() as c:
-        if team or svc:
+        if team or svc or scoped:
+            scope_team = u["team"] if scoped else team
             rows = c.execute(
                 "SELECT e.* FROM events e LEFT JOIN deploys d ON e.deploy_id=d.id "
                 "LEFT JOIN services s ON d.service_id=s.id "
                 "WHERE (e.deploy_id IS NULL OR (?='' OR s.team=?) AND (?='' OR s.name=?)) "
                 "ORDER BY e.id DESC LIMIT 100",
-                (team, team, svc, svc)).fetchall()
+                (scope_team, scope_team, svc, svc)).fetchall()
         else:
             rows = c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100").fetchall()
     return jsonify([dict(r) for r in rows])
