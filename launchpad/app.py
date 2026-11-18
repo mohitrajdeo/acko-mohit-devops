@@ -45,11 +45,17 @@ def db():
 
 
 def init_db():
-    # migration: add team column to pre-existing databases
+    # migrations for pre-existing databases
     with db() as c:
         cols = [r["name"] for r in c.execute("PRAGMA table_info(services)").fetchall()]
         if "team" not in cols:
             c.execute("ALTER TABLE services ADD COLUMN team TEXT DEFAULT ''")
+    with db() as c:
+        dcols = [r["name"] for r in c.execute("PRAGMA table_info(deploys)").fetchall()]
+        if "env_snapshot" not in dcols:
+            c.execute("ALTER TABLE deploys ADD COLUMN env_snapshot TEXT DEFAULT ''")
+        if "failure_stage" not in dcols:
+            c.execute("ALTER TABLE deploys ADD COLUMN failure_stage TEXT DEFAULT ''")
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS services(
@@ -68,6 +74,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS configs(
             id INTEGER PRIMARY KEY, service_id INTEGER, environment TEXT,
             key TEXT, value TEXT);
+        CREATE TABLE IF NOT EXISTS pointers(
+            service_id INTEGER, environment TEXT,
+            version TEXT, container TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (service_id, environment));
         """)
 
 
@@ -133,14 +144,18 @@ def do_build(service_id, version):
 def deploy(service_id, version, environment):
     with db() as c:
         svc = c.execute("SELECT * FROM services WHERE id=?", (service_id,)).fetchone()
-        cur = c.execute(
-            "INSERT INTO deploys(service_id,version,environment,status,started_at) VALUES(?,?,?,?,?)",
-            (service_id, version, environment, "deploying", now()))
-        deploy_id = cur.lastrowid
-        container = f"lp-{svc['name']}-{environment}"
+        # snapshot the env vars AT DEPLOY TIME — rollback restores THIS, not the
+        # live table (protects against config rotation between good deploy and failure)
         env_vars = {r["key"]: r["value"] for r in c.execute(
             "SELECT key,value FROM configs WHERE service_id=? AND environment=?",
             (service_id, environment))}
+        cur = c.execute(
+            "INSERT INTO deploys(service_id,version,environment,status,started_at,env_snapshot) "
+            "VALUES(?,?,?,?,?,?)",
+            (service_id, version, environment, "deploying", now(),
+             json.dumps(env_vars)))
+        deploy_id = cur.lastrowid
+        container = f"lp-{svc['name']}-{environment}"
 
     if not acquire_lock(service_id, environment):
         _finish_deploy(deploy_id, "rejected",
@@ -167,8 +182,10 @@ def deploy(service_id, version, environment):
         release_lock(service_id, environment)
         return deploy_id
 
-    # health gate
+    # health gate with failure-stage telemetry: WHERE did it turn red?
     healthy = False
+    ever_reachable = False
+    consecutive_ok = 0
     for i in range(1, HEALTH_RETRIES + 1):
         time.sleep(HEALTH_INTERVAL)
         try:
@@ -177,20 +194,40 @@ def deploy(service_id, version, environment):
                 if resp.status == 200:
                     healthy = True
                     break
+                ever_reachable = True   # got a real HTTP answer (e.g. 503 "warming")
         except Exception:
             pass
         log_event(deploy_id, "health.retry", f"probe {i}/{HEALTH_RETRIES} failed")
+    if not healthy:
+        # container state decides the stage
+        st = run(f"docker inspect -f '{{{{.State.Status}}}}' {tmp} 2>/dev/null").stdout.strip()
+        if st != "running":
+            stage = "never_started"          # image/port/entrypoint problem
+        elif not ever_reachable:
+            stage = "startup_unreachable"    # app crashes before binding (config/startup)
+        else:
+            stage = "never_healthy"          # reachable but never 200 (e.g. stuck warming)
+        with db() as c:
+            c.execute("UPDATE deploys SET failure_stage=? WHERE id=?", (stage, deploy_id))
+        log_event(deploy_id, "health.failure_stage",
+                  f"{stage} — " + {
+                      "never_started": "container did not start (image/port/entrypoint)",
+                      "startup_unreachable": "app crashed during startup (check config/secrets)",
+                      "never_healthy": "reachable but never healthy (stuck startup step)",
+                  }[stage])
 
     if healthy:
         run(f"docker rm {container} 2>/dev/null")   # old stopped container, superseded
         run(f"docker rename {tmp} {container}")
+        _set_pointer(service_id, environment, version, container)  # pointer move
         _finish_deploy(deploy_id, "healthy", f"port {host_port}")
     else:
         # failed gate: discard new container, restore the previous one
         run(f"docker rm -f {tmp} 2>/dev/null")
         if old_existed:
             run(f"docker start {container}")
-            prev = last_good_version(service_id, environment, deploy_id)
+            prev, prev_snap = last_good_version(service_id, environment, deploy_id)
+            _set_pointer(service_id, environment, prev, container)
             _finish_deploy(deploy_id, "rolled_back", "restored previous running version",
                            effective_version=prev)
             log_event(deploy_id, "rollback.auto", "restored previous running version")
@@ -212,30 +249,37 @@ def _finish_deploy(deploy_id, status, detail, effective_version=None):
 
 
 def last_good_version(service_id, environment, exclude_deploy):
+    """Returns (version, env_snapshot) of the most recent healthy deploy."""
     with db() as c:
         row = c.execute(
-            "SELECT version FROM deploys WHERE service_id=? AND environment=? "
+            "SELECT version, env_snapshot FROM deploys WHERE service_id=? AND environment=? "
             "AND status='healthy' AND id<? ORDER BY id DESC LIMIT 1",
             (service_id, environment, exclude_deploy)).fetchone()
-    return row["version"] if row else None
+    if not row:
+        return None, None
+    snap = json.loads(row["env_snapshot"]) if row["env_snapshot"] else None
+    return row["version"], snap
 
 
 def _auto_rollback(svc, failed_deploy_id, environment):
-    good = last_good_version(svc["id"], environment, failed_deploy_id)
+    good, snapshot = last_good_version(svc["id"], environment, failed_deploy_id)
     if not good:
         _finish_deploy(failed_deploy_id, "rollback_failed",
                        "no previous good version — leaving current state")
         return
-    log_event(failed_deploy_id, "rollback.auto", f"redeploying last good: {good}")
-    # deploy the good version without recursion into gating
+    # prefer the deploy-time snapshot (config as it was when this version was healthy);
+    # fall back to live table only for very old rows without snapshots
+    env_vars = snapshot if snapshot is not None else _get_env_vars(svc["id"], environment)
+    log_event(failed_deploy_id, "rollback.auto",
+              f"pointer -> {good} (config snapshot {'deploy-time' if snapshot is not None else 'live'})")
     container = f"lp-{svc['name']}-{environment}"
-    env_vars = _get_env_vars(svc["id"], environment)
     env_flags = " ".join(f"-e {k}={v}" for k, v in env_vars.items())
     env_offset = 100 if environment == "prod" else 0
     host_port = SERVICE_PORT_BASE + svc["id"] + env_offset
     run(f"docker rm -f {container} 2>/dev/null")
     r = run(f"docker run -d --name {container} {env_flags} "
             f"-p {host_port}:{svc['port']} localhost:5000/{svc['name']}:{good}")
+    _set_pointer(svc["id"], environment, good if ok_ok(r) else None, container)
     ok = r.returncode == 0
     _finish_deploy(failed_deploy_id, "rolled_back" if ok else "rollback_failed",
                    f"recovered to {good}" if ok else r.stderr,
@@ -246,6 +290,18 @@ def _auto_rollback(svc, failed_deploy_id, environment):
             c.execute("INSERT INTO deploys(service_id,version,environment,status,detail,started_at,finished_at) "
                       "VALUES(?,?,?,?,?,?,?)",
                       (svc["id"], good, environment, "healthy", "auto-rollback", now(), now()))
+
+
+def ok_ok(r):
+    return r.returncode == 0
+
+
+def _set_pointer(service_id, environment, version, container):
+    if version is None:
+        return
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO pointers(service_id,environment,version,container,updated_at) "
+                  "VALUES(?,?,?,?,?)", (service_id, environment, version, container, now()))
 
 
 def _get_env_vars(service_id, environment):
@@ -303,7 +359,7 @@ def api_rollback(did):
     with db() as c:
         d = c.execute("SELECT * FROM deploys WHERE id=?", (did,)).fetchone()
         svc = c.execute("SELECT * FROM services WHERE id=?", (d["service_id"],)).fetchone()
-    good = last_good_version(svc["id"], d["environment"], did)
+    good, _snap = last_good_version(svc["id"], d["environment"], did)
     if not good:
         return jsonify(error="no earlier good version"), 400
     log_event(did, "rollback.manual", f"to {good}")
