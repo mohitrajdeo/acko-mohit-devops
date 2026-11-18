@@ -928,6 +928,11 @@ def ui():
     return LOGIN_PAGE
 
 
+@app.get("/envs")
+def envs_ui():
+    return ENVS_PAGE
+
+
 @app.get("/diff")
 def diff_ui():
     return DIFF_PAGE
@@ -941,6 +946,76 @@ def admin_ui():
 @app.get("/dashboard")
 def dashboard_ui():
     return DASH_PAGE
+
+
+ENVS_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — staging vs prod</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f0f2f5;margin:20px}
+h1{color:#1a3c6e;font-size:20px}
+.card{background:#fff;border:1px solid #d8d8d8;border-radius:8px;padding:16px;margin-bottom:14px}
+.cols{display:flex;gap:16px;flex-wrap:wrap}
+.col{flex:1;min-width:300px;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa}
+.stg{border-top:4px solid #1a6ec0}.prd{border-top:4px solid green}
+select{padding:6px}button{padding:6px 14px;cursor:pointer;background:#1a3c6e;color:#fff;border:none;border-radius:5px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #e2e2e2;padding:5px 8px;font-size:13px;background:#fff}
+pre{background:#0d1117;color:#e6edf3;padding:10px;border-radius:6px;overflow:auto;font-size:11px;white-space:pre}
+.badge{padding:1px 8px;border-radius:10px;font-size:11px;color:#fff;background:green}
+h2{font-size:16px;margin:4px 0 8px}
+</style></head><body>
+<h1>Launchpad — staging vs production (same service, side by side)</h1>
+<div class=card>
+<b>Service</b> <select id=svc onchange=load()></select>
+<button onclick=location.href="/diff">Open full diff viewer</button>
+</div>
+<div class=cols>
+<div class="col stg"><h2 style=color:#1a6ec0>STAGING <span id=stg-port></span></h2><div id=stg>…</div></div>
+<div class="col prd"><h2 style=color:green>PRODUCTION <span id=prd-port></span></h2><div id=prd>…</div></div>
+</div>
+<div class=card id=diffbox><h2>Diff between what runs in staging vs prod</h2><div id=dd>…</div></div>
+<script>
+const H = {"X-Session": localStorage.getItem("lp_session")};
+const esc = t => t.replace(/&/g,"&amp;").replace(/</g,"&lt;");
+const colorize = l => l.startsWith("+")&&!l.startsWith("+++") ? '<span style=color:#3fb950>'+esc(l)+'</span>'
+  : l.startsWith("-")&&!l.startsWith("---") ? '<span style=color:#f85149>'+esc(l)+'</span>' : esc(l);
+
+async function init(){
+  const svcs = await (await fetch("/api/services",{headers:H})).json();
+  svc.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name} (team ${x.team||"?"})</option>`).join("");
+  load();
+}
+async function load(){
+  const sid = svc.value;
+  const deploys = await (await fetch("/api/deploys",{headers:H})).json();
+  const mine = deploys.filter(d=>d.service_id==sid);
+  const port = env => (8100 + Number(sid)) + (env==="prod" ? 100 : 0);
+  const box = (env) => {
+    const rows = mine.filter(d=>d.environment===env).slice(0,4);
+    const live = rows.find(d=>d.status==="healthy");
+    document.getElementById(env==="staging"?"stg-port":"prd-port").textContent =
+      "→ http://localhost:" + port(env);
+    return `<table><tr><th>at</th><th>version</th><th>status</th></tr>
+      ${rows.map(d=>`<tr><td>${(d.finished_at||"").slice(11,16)||""}</td>
+      <td>${d.version}${d.status==="healthy"?' <span class=badge>live</span>':""}</td>
+      <td style="color:${d.status==='healthy'?'green':'#b35400'}">${d.status}</td></tr>`).join("")
+      || "<tr><td colspan=3>nothing deployed here yet</td></tr>"}</table>
+      <p><small>${live ? "Running "+live.version+" on port "+port(env) : "nothing running"}</small></p>
+      <button onclick="fetch('/api/services/'+svc.value+'/deploy',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify({version:(deploys||[]).find(d=>d.service_id==svc.value&&d.status==='healthy')?.version||'',environment:'${env}'})}).then(()=>load())">Re-deploy here</button>`;
+  };
+  stg.innerHTML = box("staging");
+  prd.innerHTML = box("prod");
+  // diff between live staging and live prod versions
+  const live = env => mine.filter(d=>d.environment===env&&d.status==="healthy")[0]?.version;
+  const a = live("staging"), b = live("prod");
+  const dd = document.getElementById("dd");
+  if (!a || !b){ dd.innerHTML = "<i>need a healthy version in both envs to diff</i>"; return; }
+  if (a === b){ dd.innerHTML = `<span class=badge>identical</span> both environments run <b>${a}</b> — same bits everywhere.`; return; }
+  const d = await (await fetch(`/api/services/${sid}/diff?from=${b}&to=${a}`,{headers:H})).json();
+  dd.innerHTML = `<p>prod runs <b style=color:green>${b}</b>, staging runs <b style=color:#1a6ec0>${a}</b> — physical difference:</p>
+    <pre>${(d.diff||d.stat||"").split("\n").map(colorize).join("\n")}</pre>
+    <p><small>commits: ${(d.commits||[]).join(" · ")||"same commit"}</small></p>`;
+}
+init();
+</script></body></html>"""
 
 
 DIFF_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — version diff</title>
@@ -1100,8 +1175,6 @@ async function rb(name, did, sid){
   load();
 }
 load();
-}
-load();
 </script></body></html>"""
 
 
@@ -1116,7 +1189,8 @@ button{padding:4px 10px;cursor:pointer}
 </style></head><body>
 <div class=top><h1>Launchpad — admin console</h1><div><span id=who></span>
 <button onclick='location.href="/"'>Switch user</button>
-<button onclick=runPreflight()>Re-run control-plane checks</button></div></div>
+<button onclick=runPreflight()>Re-run control-plane checks</button>
+<button onclick='location.href="/envs"'>Staging vs prod</button></div></div>
 <div class=grid>
 <div class=card style=min-width:340px><h2>Control plane</h2><div id=cp>checking…</div></div>
 <div class=card style=min-width:340px><h2>Resources</h2><div id=res>checking…</div></div>
@@ -1124,8 +1198,11 @@ button{padding:4px 10px;cursor:pointer}
 <div class=card style="min-width:520px;flex:2"><h2>Delivery metrics</h2><div id=mets>loading…</div></div>
 </div>
 <h2>All teams — what's running where</h2>
-<table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th></tr>
+<table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th>
+<th>Deploy to staging</th><th>Push to production</th></tr>
 <tbody id=rows></tbody></table>
+<small>Staging buttons deploy the version healthy in staging's history (or latest built);
+Push to production promotes the version currently healthy in staging — nothing goes to prod without passing the staging gate first.</small>
 <h2>Team detail (latest 5 per team)</h2>
 <div id=teamcards></div>
 <script>
@@ -1161,12 +1238,18 @@ async function load(){
          <div style="background:#c0392b;height:12px;width:${100*n/fmax}%;border-radius:4px"></div></div>
          <small>${n} failed / rolled back</small></div>`).join("")
     : "<span class=ok>none</span>";
-  let html = "";
+  let html = "", svcIds = {};
+  const allSvcs = await (await fetch("/api/services",{headers:H})).json();
+  for (const x of allSvcs) svcIds[x.name] = x.id;
   for (const [team, svcs] of Object.entries(o.teams||{}))
-    for (const s of svcs)
+    for (const s of svcs) {
+      const sid = svcIds[s.service];
       html += `<tr><td><b>${team}</b></td><td>${s.service}</td>
-        <td style="color:${s.status==='healthy'?'green':'#b35400'}">${s.status}</td>
-        <td>${s.version} (${s.env})</td></tr>`;
+        <td style="color:${s.status==='running'?'green':'#b35400'}">${s.status}</td>
+        <td>${s.version} (${s.env})</td>
+        <td><button onclick=deployStaging(${sid})>Deploy to staging</button></td>
+        <td><button onclick=promoteSvc(${sid}) style="background:#1a6ec0;color:#fff">Push to production</button></td></tr>`;
+    }
   rows.innerHTML = html;
 
   // delivery metrics: per service bars for failure%, deploys/day, MTTR, lead time
@@ -1335,7 +1418,18 @@ async function rollbackSvc(name, id) {{
   const d = deploys.find(x => x.service === name);
   if (d) call("/api/deploys/" + d.id + "/rollback", {{version: v}});
 }}
-function promoteSvc(id) {{ if (confirm("Promote current staging version to prod?")) call("/api/services/" + id + "/promote", {{}}); }}
+function promoteSvc(id) {{ call("/api/services/" + id + "/promote", {{}});
+  alert("Pushed to production — health gate runs on prod port; watch the events."); }}
+async function deployStaging(sid) {{
+  // deploy the latest healthy staging version (or the newest built) to staging again
+  const av = await (await fetch("/api/services/" + sid + "/all_versions", {{headers:H}})).json();
+  const deploys = await (await fetch("/api/deploys", {{headers:H}})).json();
+  const goodStg = deploys.filter(d => d.service_id == sid && d.environment === "staging" && d.status === "healthy");
+  const v = (goodStg[0] && goodStg[0].version) || (av.built && av.built[0]) || (av.all && av.all[0]);
+  if (!v) {{ alert("No versions available — build one first."); return; }}
+  call("/api/services/" + sid + "/deploy", {{version: v, environment: "staging"}});
+  alert("Staging deploy started for " + v);
+}}
 async function rollbackSvc(name) {{
   const r = await fetch("/api/deploys"); const deploys = await r.json();
   const d = deploys.find(x => x.service === name);
