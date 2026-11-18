@@ -204,12 +204,21 @@ def do_build(service_id, version):
             c.execute("UPDATE builds SET log=? WHERE id=?", ("\n".join(log), build_id))
         return ok
 
-    ok = all([
-        step(f"git -C '{svc['repo_path']}' checkout -f {version}"),
-        step(f"git -C '{svc['repo_path']}' clean -fd"),
-        step(f"docker build -t localhost:5000/{svc['name']}:{version} '{svc['repo_path']}'"),
-        step(f"docker push localhost:5000/{svc['name']}:{version}"),
-    ])
+    # fail fast: never continue (esp. never docker build/push) after a failed step —
+    # a failed checkout must not produce a mistagged image
+    ok = True
+    for cmd in (
+            f"git -C '{svc['repo_path']}' checkout -f {version}",
+            f"git -C '{svc['repo_path']}' clean -fd",
+            f"docker build -t localhost:5000/{svc['name']}:{version} '{svc['repo_path']}'",
+            f"docker push localhost:5000/{svc['name']}:{version}"):
+        if not step(cmd):
+            log.append(f"! build aborted: step failed -> {cmd.split()[0]}")
+            with db() as c:
+                c.execute("UPDATE builds SET log=? WHERE id=?",
+                          ("\n".join(log), build_id))
+            ok = False
+            break
     with db() as c:
         c.execute("UPDATE builds SET status=? WHERE id=?",
                   ("ok" if ok else "failed", build_id))
