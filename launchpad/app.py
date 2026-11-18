@@ -307,6 +307,41 @@ def api_deploys():
     return jsonify([dict(r) for r in rows])
 
 
+@app.get("/api/services/<int:sid>/versions")
+def api_versions(sid):
+    """Git tags available in the repo + recent builds of this service."""
+    with db() as c:
+        svc = c.execute("SELECT repo_path FROM services WHERE id=?", (sid,)).fetchone()
+        if not svc:
+            return jsonify(error="unknown service"), 404
+    r = run(f"git -C '{svc['repo_path']}' tag --sort=-creatordate")
+    tags = [t for t in r.stdout.split() if t]
+    with db() as c:
+        builds = c.execute(
+            "SELECT id, version, status, created_at FROM builds "
+            "WHERE service_id=? ORDER BY id DESC LIMIT 10", (sid,)).fetchall()
+    return jsonify(tags=tags, builds=[dict(b) for b in builds])
+
+
+@app.get("/api/builds/<int:bid>/log")
+def api_build_log(bid):
+    with db() as c:
+        b = c.execute("SELECT log FROM builds WHERE id=?", (bid,)).fetchone()
+    if not b:
+        return jsonify(error="unknown build"), 404
+    return jsonify(log=b["log"])
+
+
+@app.get("/api/services/<int:sid>/healthy_versions")
+def api_healthy_versions(sid):
+    """Distinct versions that ever passed the health gate — valid rollback targets."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT DISTINCT version FROM deploys WHERE service_id=? AND status='healthy' "
+            "ORDER BY version DESC", (sid,)).fetchall()
+    return jsonify([r["version"] for r in rows])
+
+
 @app.get("/api/metrics")
 def api_metrics():
     """Delivery metrics per service: ship frequency, failure rate, MTTR."""
@@ -426,7 +461,7 @@ def ui():
             f"<td class=actions>"
             f"<button onclick=deploySvc({r['id']},'{r['name']}')>Deploy</button> "
             f"<button onclick=promoteSvc({r['id']})>Promote→prod</button> "
-            f"<button onclick=rollbackSvc('{r['name']}')>Rollback</button></td></tr>")
+            f"<button onclick=rollbackSvc('{r['name']}',{r['id']})>Rollback</button></td></tr>")
     ev_table = "".join(
         f"<tr><td>{r['created_at']}</td><td><b>{r['type']}</b></td><td>{str(r['detail'])[:90]}</td></tr>"
         for r in ev_rows)
@@ -485,12 +520,25 @@ async function call(url, body) {{
   const j = await r.json();
   alert(JSON.stringify(j)); location.reload();
 }}
-function deploySvc(id, name) {{
-  const v = prompt("Version to build+deploy (git tag), e.g. v1.1.0:");
+async function deploySvc(id, name) {{
+  const r = await fetch("/api/services/" + id + "/versions");
+  const info = await r.json();
+  const tagList = (info.tags && info.tags.length) ? info.tags.join(", ") : "no tags found";
+  const v = prompt("Versions available in the repo:\n" + tagList + "\n\nGit tag or commit to build+deploy:", (info.tags && info.tags[0]) || "v1.0.0");
   if (!v) return;
   const env = prompt("Environment: staging or prod:", "staging") || "staging";
   call("/api/services/" + id + "/build", {{version: v}}).then(() =>
     call("/api/services/" + id + "/deploy", {{version: v, environment: env}}));
+}}
+async function rollbackSvc(name, id) {{
+  const r = await fetch("/api/services/" + id + "/healthy_versions");
+  const versions = await r.json();
+  if (!versions.length) {{ alert("No healthy version to roll back to."); return; }}
+  const v = prompt("Healthy versions (any is a valid rollback target):\n" + versions.join("\n") + "\n\nRoll back to:", versions[0]);
+  if (!v) return;
+  const dr = await fetch("/api/deploys"); const deploys = await dr.json();
+  const d = deploys.find(x => x.service === name);
+  if (d) call("/api/deploys/" + d.id + "/rollback", {{version: v}});
 }}
 function promoteSvc(id) {{ if (confirm("Promote current staging version to prod?")) call("/api/services/" + id + "/promote", {{}}); }}
 async function rollbackSvc(name) {{
