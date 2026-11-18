@@ -307,6 +307,77 @@ def api_deploys():
     return jsonify([dict(r) for r in rows])
 
 
+@app.get("/api/metrics")
+def api_metrics():
+    """Delivery metrics per service: ship frequency, failure rate, MTTR."""
+    out = []
+    with db() as c:
+        for svc in c.execute("SELECT id, name FROM services").fetchall():
+            deploys = c.execute(
+                "SELECT status, started_at, finished_at, environment FROM deploys "
+                "WHERE service_id=? ORDER BY id", (svc["id"],)).fetchall()
+            total = len(deploys)
+            failed = sum(1 for d in deploys if d["status"] in
+                         ("failed", "rolled_back", "rollback_failed"))
+            # deploys per day (from first deploy to now)
+            days = max(1, _days_span(d["started_at"] for d in deploys))
+            # MTTR: for each failure, time until next healthy deploy of same service
+            mttrs = []
+            for i, d in enumerate(deploys):
+                if d["status"] in ("failed", "rolled_back", "rollback_failed"):
+                    # recovery via the auto-rollback itself (same deploy row)
+                    if d["status"] == "rolled_back" and d["started_at"] and d["finished_at"]:
+                        gap = _minutes_between(d["started_at"], d["finished_at"])
+                        if gap is not None:
+                            mttrs.append(gap)
+                        continue
+                    # recovery via a later healthy deploy
+                    for later in deploys[i + 1:]:
+                        if later["status"] == "healthy":
+                            gap = _minutes_between(d["finished_at"], later["finished_at"])
+                            if gap is not None:
+                                mttrs.append(gap)
+                            break
+            # avg build duration
+            builds = c.execute(
+                "SELECT started, finished FROM build_timings WHERE service_id=?",
+                (svc["id"],)).fetchall() if False else []
+            out.append({
+                "service": svc["name"],
+                "deploys_total": total,
+                "deploys_per_day": round(total / days, 1),
+                "deploy_failure_pct": round(100 * failed / total, 1) if total else 0.0,
+                "mttr_minutes": round(sum(mttrs) / len(mttrs), 1) if mttrs else None,
+                "last_status": deploys[-1]["status"] if deploys else None,
+            })
+    return jsonify(out)
+
+
+def _days_span(timestamps):
+    """Span in days between the first and last timestamp (min 1 day)."""
+    import datetime as dt
+    ts = sorted(t for t in timestamps if t)
+    if len(ts) < 2:
+        return 1
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    try:
+        a = dt.datetime.strptime(ts[0][:19], fmt)
+        b = dt.datetime.strptime(ts[-1][:19], fmt)
+        return max(1, round((b - a).total_seconds() / 86400, 2))
+    except ValueError:
+        return 1
+
+
+def _minutes_between(a, b):
+    import datetime as dt
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    try:
+        return round((dt.datetime.strptime(b[:19], fmt) -
+                      dt.datetime.strptime(a[:19], fmt)).total_seconds() / 60, 1)
+    except (ValueError, TypeError):
+        return None
+
+
 @app.get("/api/events")
 def api_events():
     with db() as c:
