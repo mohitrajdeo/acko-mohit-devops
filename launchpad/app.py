@@ -338,6 +338,23 @@ def api_build_log(bid):
     return jsonify(log=b["log"])
 
 
+@app.get("/api/services/<int:sid>/all_versions")
+def api_all_versions(sid):
+    """Every deployable version: git tags + versions we built before (deduped)."""
+    with db() as c:
+        svc = c.execute("SELECT repo_path FROM services WHERE id=?", (sid,)).fetchone()
+        if not svc:
+            return jsonify(error="unknown service"), 404
+    r = run(f"git -C '{svc['repo_path']}' tag --sort=-creatordate")
+    tags = [t for t in r.stdout.split() if t]
+    with db() as c:
+        built = [row[0] for row in c.execute(
+            "SELECT DISTINCT version FROM builds WHERE service_id=? AND status='ok' "
+            "ORDER BY version DESC", (sid,)).fetchall()]
+    merged = list(dict.fromkeys(tags + built))
+    return jsonify({"tags": tags, "built": built, "all": merged})
+
+
 @app.get("/api/services/<int:sid>/healthy_versions")
 def api_healthy_versions(sid):
     """Distinct versions that ever passed the health gate — valid rollback targets."""
@@ -543,20 +560,42 @@ async function call(url, body) {{
   alert(JSON.stringify(j)); location.reload();
 }}
 async function deploySvc(id, name) {{
-  const r = await fetch("/api/services/" + id + "/versions");
+  const r = await fetch("/api/services/" + id + "/all_versions");
   const info = await r.json();
-  const tagList = (info.tags && info.tags.length) ? info.tags.join(", ") : "no tags found";
-  const v = prompt("Versions available in the repo:\n" + tagList + "\n\nGit tag or commit to build+deploy:", (info.tags && info.tags[0]) || "v1.0.0");
+  const versions = info.all || [];
+  if (!versions.length) {{ alert("No versions found in the repo."); return; }}
+  const opts = versions.map(v =>
+    `<option value="${{v}}">${{v}}${{info.built.includes(v) ? " (built)" : " (tag)"}}</option>`).join("");
+  const v = prompt2("Deploy " + name, "Version", opts);
   if (!v) return;
-  const env = prompt("Environment: staging or prod:", "staging") || "staging";
+  const env = prompt2("Deploy " + name + " — environment", "Environment",
+                      `<option value="staging">staging</option><option value="prod">prod</option>`);
+  if (!env) return;
   call("/api/services/" + id + "/build", {{version: v}}).then(() =>
     call("/api/services/" + id + "/deploy", {{version: v, environment: env}}));
+}}
+
+function prompt2(title, label, optionsHtml) {{
+  return new Promise(resolve => {{
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:9";
+    ov.innerHTML = `<div style="background:#fff;padding:18px 22px;border-radius:8px;min-width:320px">
+      <b>${{title}}</b><p style="margin:8px 0 4px">${{label}}</p>
+      <select id="pp-sel" style="width:100%;padding:6px">${{optionsHtml}}</select>
+      <div style="margin-top:12px;text-align:right">
+        <button id="pp-cancel">Cancel</button>
+        <button id="pp-ok" style="background:#1a3c6e;color:#fff">Select</button></div></div>`;
+    document.body.appendChild(ov);
+    ov.querySelector("#pp-cancel").onclick = () => {{ ov.remove(); resolve(null); }};
+    ov.querySelector("#pp-ok").onclick = () => {{ const v = ov.querySelector("#pp-sel").value; ov.remove(); resolve(v); }};
+  }});
 }}
 async function rollbackSvc(name, id) {{
   const r = await fetch("/api/services/" + id + "/healthy_versions");
   const versions = await r.json();
   if (!versions.length) {{ alert("No healthy version to roll back to."); return; }}
-  const v = prompt("Healthy versions (any is a valid rollback target):\n" + versions.join("\n") + "\n\nRoll back to:", versions[0]);
+  const opts = versions.map(v => `<option value="${{v}}">${{v}}</option>`).join("");
+  const v = await prompt2("Roll back " + name, "Target version (healthy only)", opts);
   if (!v) return;
   const dr = await fetch("/api/deploys"); const deploys = await dr.json();
   const d = deploys.find(x => x.service === name);
