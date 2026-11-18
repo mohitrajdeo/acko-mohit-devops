@@ -493,13 +493,14 @@ def api_admin_overview():
     with db() as c:
         teams = {}
         for r in c.execute(
-                "SELECT s.name, s.team, d.version, d.environment, d.status "
-                "FROM services s LEFT JOIN deploys d ON d.id = "
-                "(SELECT id FROM deploys WHERE service_id=s.id ORDER BY id DESC LIMIT 1)").fetchall():
+                "SELECT s.name, s.team, COALESCE(p.version,'—') as version, "
+                "COALESCE(p.environment,'—') as environment, "
+                "CASE WHEN p.version IS NULL THEN 'never deployed' ELSE 'running' END as status "
+                "FROM services s LEFT JOIN pointers p ON p.service_id=s.id").fetchall():
             t = r["team"] or "unassigned"
             teams.setdefault(t, []).append(
                 {"service": r["name"], "version": r["version"],
-                 "env": r["environment"], "status": r["status"] or "never deployed"})
+                 "env": r["environment"], "status": r["status"]})
         # failed deploys last 24h per team
         recent = c.execute(
             "SELECT s.team, COUNT(*) n FROM deploys d JOIN services s ON s.id=d.service_id "
@@ -530,8 +531,7 @@ def api_admin_overview():
                 f"WHERE d.service_id IN ({qmarks}) OR e.deploy_id IS NULL "
                 f"ORDER BY e.id DESC LIMIT 5", ids).fetchall()
             healthy_now = sum(1 for sid, _ in svcs if c.execute(
-                "SELECT 1 FROM deploys WHERE service_id=? AND status='healthy' "
-                "AND id=(SELECT MAX(id) FROM deploys WHERE service_id=?)", (sid, sid)).fetchone())
+                "SELECT 1 FROM pointers WHERE service_id=? ", (sid,)).fetchone())
             team_detail[team] = {
                 "services": [n for _, n in svcs],
                 "services_total": len(svcs),
