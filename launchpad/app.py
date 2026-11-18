@@ -509,7 +509,39 @@ def api_admin_overview():
         preflight = json.loads((Path(__file__).parent / "preflight.json").read_text())
     except Exception:
         preflight = {"status": "UNKNOWN", "failed": None, "total": None}
+
+    # per-team deep view: last 5 deploys, last 5 events, quick stats
+    team_detail = {}
+    svc_ids = {}
+    with db() as c:
+        for sid, name, team in c.execute("SELECT id, name, team FROM services").fetchall():
+            svc_ids.setdefault(team or "unassigned", []).append((sid, name))
+        for team, svcs in svc_ids.items():
+            ids = [sid for sid, _ in svcs]
+            qmarks = ",".join("?" * len(ids))
+            last_deploys = c.execute(
+                f"SELECT d.id, s.name as service, d.version, d.environment, d.status, "
+                f"d.finished_at FROM deploys d JOIN services s ON s.id=d.service_id "
+                f"WHERE d.service_id IN ({qmarks}) ORDER BY d.id DESC LIMIT 5",
+                ids).fetchall()
+            last_events = c.execute(
+                f"SELECT e.created_at, e.type, e.detail FROM events e "
+                f"LEFT JOIN deploys d ON e.deploy_id=d.id LEFT JOIN services s ON d.service_id=s.id "
+                f"WHERE d.service_id IN ({qmarks}) OR e.deploy_id IS NULL "
+                f"ORDER BY e.id DESC LIMIT 5", ids).fetchall()
+            healthy_now = sum(1 for sid, _ in svcs if c.execute(
+                "SELECT 1 FROM deploys WHERE service_id=? AND status='healthy' "
+                "AND id=(SELECT MAX(id) FROM deploys WHERE service_id=?)", (sid, sid)).fetchone())
+            team_detail[team] = {
+                "services": [n for _, n in svcs],
+                "services_total": len(svcs),
+                "healthy_now": healthy_now,
+                "last_deploys": [dict(d) for d in last_deploys],
+                "last_events": [dict(e) for e in last_events],
+            }
+
     return jsonify(teams=teams,
+                   team_detail=team_detail,
                    failures_24h={r["team"]: r["n"] for r in recent},
                    control_plane=preflight["status"],
                    control_plane_detail=f"{preflight.get('total', '?') - (preflight.get('failed') or 0)}"
@@ -853,6 +885,8 @@ button{padding:4px 10px;cursor:pointer}
 <h2>All teams — what's running where</h2>
 <table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th></tr>
 <tbody id=rows></tbody></table>
+<h2>Team detail (latest 5 per team)</h2>
+<div id=teamcards></div>
 <script>
 const S = localStorage.getItem("lp_session");
 const H = {"X-Session": S};
@@ -873,6 +907,19 @@ async function load(){
         <td style="color:${s.status==='healthy'?'green':'#b35400'}">${s.status}</td>
         <td>${s.version} (${s.env})</td></tr>`;
   rows.innerHTML = html;
+
+  // team detail cards: last 5 deploys + events per team
+  const td = o.team_detail || {};
+  teamcards.innerHTML = Object.entries(td).map(([team, t]) => `
+    <div class=card style="margin-bottom:14px;min-width:100%">
+      <b style=color:#1a3c6e>${team}</b> — ${t.healthy_now}/${t.services_total} services healthy
+      <table style="margin-top:8px"><tr><th colspan=3>last 5 deploys</th></tr>
+        ${t.last_deploys.map(d=>`<tr><td>${d.finished_at||""}</td><td>${d.service} ${d.version}</td><td>${d.status} (${d.environment})</td></tr>`).join("")}
+      </table>
+      <table style="margin-top:6px"><tr><th colspan=3>last 5 events</th></tr>
+        ${t.last_events.map(e=>`<tr><td>${e.created_at}</td><td><b>${e.type}</b></td><td>${String(e.detail).slice(0,60)}</td></tr>`).join("")}
+      </table>
+    </div>`).join("");
 }
 async function runPreflight(){
   cp.textContent = "running checks…";
