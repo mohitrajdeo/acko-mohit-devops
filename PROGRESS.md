@@ -60,6 +60,23 @@ entries below are logged as they happened on build day.
   git tags (not a blank prompt), rollback target choice among all healthy versions,
   build logs viewable via API.
 
+## Session 7 — beyond must-haves (PO opened the door)
+
+- **14:10 — Deploy-time config snapshots.** Edge case: config rotated between a good
+  deploy and a failure would make rollback redeploy old code with NEW config → crash
+  loop ("env mismatch"). Fixed: every deploy stores its env vars as a snapshot;
+  rollback restores the deploy-time snapshot, never the live table.
+- **14:15 — Version pointer per (service × environment).** Rollback is now a pointer
+  move to a stored healthy version (no rebuild), matching how real platforms
+  retarget load balancers. `pointers` table shows what's live per env.
+- **14:18 — Failure-stage telemetry ("where did it turn red").** Health gate now
+  classifies the failure: `never_started` (image/port/entrypoint),
+  `startup_unreachable` (app crashes at boot — usually config/secrets),
+  `never_healthy` (reachable but stuck warming). Events + deploy row carry the stage;
+  live run classified policy-svc-style failures as `startup_unreachable` correctly.
+- **14:20 — e2e re-run: 15/15 ALL GREEN** after the upgrades (one regression caught
+  en route: rollback endpoint unpacked the new tuple return — fixed).
+
 ## Gate 2 status (what works now)
 
 - All 10 must-haves built; 9 of them proven live by tests in this log.

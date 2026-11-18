@@ -21,6 +21,15 @@ Each entry: time made (IST), decision, reason. "PO" = product owner (Harish Rama
 - **12:47 — `git checkout -f` + `git clean -fd` before every build.** Found a dirty
   working tree (CRLF damage from Windows sync) being silently built and labelled v1.1.0
   while containing v1.2.0 code. Builds must come from pristine tag content.
+- **14:10 — Rollback restores the deploy-time config snapshot, not the live table.**
+  Guards against the env-mismatch crash loop: config rotated after the good deploy
+  would otherwise be applied to old code during rollback. (User-raised edge case.)
+- **14:15 — Rollback is a pointer move, not a rebuild.** Immutable containers stay
+  in place; a `pointers` record names the live version per (service × environment).
+  Deploy strategies (e.g. blue-green-lite: run new alongside, gate, cut pointer)
+  can hook this without changing the contract. Feature flags remain a separate
+  service concern (Flagship-style); Launchpad provides the strategy hook they'd
+  ride on.
 
 ## Product owner answers (chat, on the day)
 
