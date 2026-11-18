@@ -989,8 +989,10 @@ button{padding:4px 10px;cursor:pointer}
 <button onclick='location.href="/"'>Switch user</button>
 <button onclick=runPreflight()>Re-run control-plane checks</button></div></div>
 <div class=grid>
-<div class=card><h2>Control plane</h2><div id=cp>checking…</div></div>
-<div class=card><h2>Failures (24h)</h2><div id=fails></div></div>
+<div class=card style=min-width:340px><h2>Control plane</h2><div id=cp>checking…</div></div>
+<div class=card style=min-width:340px><h2>Resources</h2><div id=res>checking…</div></div>
+<div class=card style=min-width:340px><h2>Failures (24h)</h2><div id=fails></div></div>
+<div class=card style="min-width:520px;flex:2"><h2>Delivery metrics</h2><div id=mets>loading…</div></div>
 </div>
 <h2>All teams — what's running where</h2>
 <table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th></tr>
@@ -1007,21 +1009,28 @@ async function load(){
   cp.innerHTML = o.control_plane==="READY"
     ? "<span class=ok>● READY</span> — " + o.control_plane_detail
     : "<span class=bad>● " + o.control_plane + "</span> — " + o.control_plane_detail;
+  const bar = (label, pct, extra, warn=70, crit=85) => {
+    const c = pct > crit ? "#c0392b" : pct > warn ? "#b35400" : "green";
+    return `<div style="margin-top:6px"><b>${label}</b>
+      <div style="background:#e0e4ea;border-radius:4px;height:12px;width:100%">
+      <div style="background:${c};height:12px;width:${Math.min(pct,100)}%;border-radius:4px"></div></div>
+      <small>${pct}% ${extra||""}</small></div>`;
+  };
+  // resources card (own card so the bars are always visible)
   const r = o.resources || {};
-  if (!r.error) {
-    const bar = (label, pct, extra) => {
-      const c = pct > 85 ? "#c0392b" : pct > 70 ? "#b35400" : "green";
-      return `<div style="margin-top:6px">${label}
-        <div style="background:#e0e4ea;border-radius:4px;height:10px;width:100%">
-        <div style="background:${c};height:10px;width:${pct}%;border-radius:4px"></div></div>
-        <small>${pct}% used ${extra||""}</small></div>`;
-    };
-    cp.innerHTML += bar("CPU", r.cpu_used_pct ?? 0, r.cpu_cores ? `· ${r.cpu_cores} cores` : "")
-      + bar("RAM", r.ram_used_pct ?? 0, `· ${r.ram_total_gb} GB total`)
-      + bar("Disk", r.disk_used_pct ?? 0, `· ${r.disk_free_gb} GB free`);
-  }
-  fails.innerHTML = Object.keys(o.failures_24h||{}).length
-    ? Object.entries(o.failures_24h).map(([t,n])=>`${t}: <span class=bad>${n}</span>`).join("<br>")
+  res.innerHTML = r.error ? ("error: " + r.error) :
+    bar("CPU", r.cpu_used_pct ?? 0, `· ${r.cpu_cores||"?"} cores`)
+    + bar("RAM", r.ram_used_pct ?? 0, `· ${r.ram_total_gb} GB total`)
+    + bar("Disk", r.disk_used_pct ?? 0, `· ${r.disk_free_gb} GB free`);
+  // failures (24h) as a bar graph per team
+  const f = o.failures_24h || {};
+  const fmax = Math.max(1, ...Object.values(f));
+  fails.innerHTML = Object.keys(f).length
+    ? Object.entries(f).map(([t,n])=>
+        `<div style="margin-top:6px"><b>${t}</b>
+         <div style="background:#e0e4ea;border-radius:4px;height:12px;width:100%">
+         <div style="background:#c0392b;height:12px;width:${100*n/fmax}%;border-radius:4px"></div></div>
+         <small>${n} failed / rolled back</small></div>`).join("")
     : "<span class=ok>none</span>";
   let html = "";
   for (const [team, svcs] of Object.entries(o.teams||{}))
@@ -1030,6 +1039,22 @@ async function load(){
         <td style="color:${s.status==='healthy'?'green':'#b35400'}">${s.status}</td>
         <td>${s.version} (${s.env})</td></tr>`;
   rows.innerHTML = html;
+
+  // delivery metrics: per service bars for failure%, deploys/day, MTTR, lead time
+  const m = await (await fetch("/api/metrics",{headers:H})).json();
+  const row = (label, val, pct, color, sub) =>
+    `<div style="margin-top:4px"><small><b>${label}</b> ${sub}</small>
+     <div style="background:#e0e4ea;border-radius:3px;height:8px;width:100%">
+     <div style="background:${color};height:8px;width:${Math.min(pct,100)}%;border-radius:3px"></div></div></div>`;
+  mets.innerHTML = (m||[]).map(x => {
+    const fp = x.deploy_failure_pct ?? 0;
+    return `<div style="margin-bottom:8px"><b>${x.service}</b>
+      ${row("failure %", "", fp, fp>30?"#c0392b":"#b35400", `— ${fp}% of ${x.deploys_total} deploys`)}
+      ${row("deploys/day", "", Math.min(100,(x.deploys_per_day??0)*5), "green", `— ${x.deploys_per_day}`)}
+      ${x.mttr_minutes!=null ? row("MTTR", "", Math.min(100, x.mttr_minutes*100), "#1a6ec0", `— ${x.mttr_minutes} min`) : ""}
+      ${x.lead_time_to_prod_minutes!=null ? row("lead time to prod", "", Math.min(100, x.lead_time_to_prod_minutes), "#7b52a8", `— ${x.lead_time_to_prod_minutes} min`) : ""}
+    </div>`;
+  }).join("");
 
   // team detail cards: last 5 deploys + events per team
   const td = o.team_detail || {};
