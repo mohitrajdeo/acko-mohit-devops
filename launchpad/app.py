@@ -969,19 +969,70 @@ async function load(){
   const seen = {};
   svcs.innerHTML = ds.filter(d=>!seen[d.service]++).map(d =>
     `<tr><td>${d.service}</td><td>${d.status}</td><td>${d.version} (${d.environment})</td>
-     <td><button onclick=rb('${d.service}',${d.id})>Rollback</button></td></tr>`).join("")
+     <td><button onclick=rb('${d.service}',${d.id},${d.service_id})>Rollback</button></td></tr>`).join("")
     || "<tr><td colspan=4>no deploys visible for your team</td></tr>";
   const ev = await (await fetch("/api/events",{headers:H})).json();
   evs.innerHTML = ev.slice(0,12).map(e =>
     `<tr><td>${e.created_at}</td><td><b>${e.type}</b></td><td>${String(e.detail).slice(0,80)}</td></tr>`).join("");
 }
-async function rb(name, did){
-  const v = prompt("Roll back "+name+" to version (e.g. v1.1.0):");
+function pselect(title, label, optionsHtml) {
+  return new Promise(resolve => {
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:9";
+    ov.innerHTML = `<div style="background:#fff;padding:18px 22px;border-radius:8px;min-width:320px">
+      <b>${title}</b><p style="margin:8px 0 4px">${label}</p>
+      <select id="ps-sel" style="width:100%;padding:6px">${optionsHtml}</select>
+      <div style="margin-top:12px;text-align:right">
+        <button id="ps-cancel">Cancel</button>
+        <button id="ps-ok" style="background:#1a3c6e;color:#fff">Roll back</button></div></div>`;
+    document.body.appendChild(ov);
+    ov.querySelector("#ps-cancel").onclick = () => { ov.remove(); resolve(null); };
+    ov.querySelector("#ps-ok").onclick = () => { const v = ov.querySelector("#ps-sel").value; ov.remove(); resolve(v); };
+  });
+}
+async function rb(name, did, sid){
+  const r = await fetch("/api/services/"+sid+"/healthy_versions",{headers:H});
+  const versions = await r.json();
+  if (!versions.length) { alert("No healthy version to roll back to."); return; }
+  const opts = versions.map(v=>`<option value="${v}">${v}</option>`).join("");
+  const v = await pselect("Roll back "+name, "Target version (healthy only)", opts);
   if(!v) return;
   await fetch("/api/deploys/"+did+"/rollback",{method:"POST",headers:{...H,"Content-Type":"application/json"},body:JSON.stringify({version:v})});
   load();
 }
+async function loadActions(){
+  const svcs = await (await fetch("/api/services",{headers:H})).json();
+  const deploys = await (await fetch("/api/deploys",{headers:H})).json();
+  const sel = document.getElementById("act-svc");
+  if (!sel.options.length)
+    sel.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name}</option>`).join("");
+  const sid = sel.value;
+  const vers = await (await fetch("/api/services/"+sid+"/all_versions",{headers:H})).json();
+  const everHealthy = new Set(), everBad = new Set();
+  for (const d of deploys) {
+    if (d.service_id != sid) continue;
+    if (d.status === "healthy") everHealthy.add(d.version);
+    else if (["failed","rolled_back","rollback_failed"].includes(d.status)) everBad.add(d.version);
+  }
+  document.getElementById("act-ver").innerHTML =
+    (vers||[]).map(v=>{
+      const tag = everHealthy.has(v) ? " (good)" : everBad.has(v) ? " (bad)" : "";
+      return `<option value="${v}" style="color:${everHealthy.has(v)?"green":"#b35400"}">${v}${tag}</option>`;
+    }).join("") || "<option>no versions — build one first</option>";
+  sel.onchange = loadActions;
+}
+async function actDeploy(){
+  const sid = document.getElementById("act-svc").value;
+  const v = document.getElementById("act-ver").value;
+  const env = document.getElementById("act-env").value;
+  if (!v || v.startsWith("no versions")) { alert("No versions yet — build one first."); return; }
+  await fetch("/api/services/"+sid+"/deploy",{method:"POST",
+    headers:{...H,"Content-Type":"application/json"},
+    body:JSON.stringify({version:v,environment:env})});
+  load();
+}
 load();
+loadActions();
 </script></body></html>"""
 
 
@@ -997,6 +1048,15 @@ button{padding:4px 10px;cursor:pointer}
 <div class=top><h1>Launchpad — admin console</h1><div><span id=who></span>
 <button onclick='location.href="/"'>Switch user</button>
 <button onclick=runPreflight()>Re-run control-plane checks</button></div></div>
+<div class=card style="margin-bottom:16px"><h2>Actions</h2>
+<table style=width:100%><tr>
+<td><b>Service</b><br><select id=act-svc style="width:100%"></select></td>
+<td><b>Version (good/bad)</b><br><select id=act-ver style="width:100%"></select></td>
+<td><b>Environment</b><br><select id=act-env style="width:100%">
+  <option value=staging>staging</option><option value=prod>prod</option></select></td>
+<td style="vertical-align:bottom"><button onclick=actDeploy() style="background:#1a3c6e;color:#fff;padding:8px 18px">Deploy / switch</button></td>
+</tr></table><small>Pick a version — (good) ever passed the health gate, (bad) always failed. Deploying switches the running version.</small>
+</div>
 <div class=grid>
 <div class=card style=min-width:340px><h2>Control plane</h2><div id=cp>checking…</div></div>
 <div class=card style=min-width:340px><h2>Resources</h2><div id=res>checking…</div></div>
@@ -1217,7 +1277,7 @@ function promoteSvc(id) {{ if (confirm("Promote current staging version to prod?
 async function rollbackSvc(name) {{
   const r = await fetch("/api/deploys"); const deploys = await r.json();
   const d = deploys.find(x => x.service === name);
-  if (d && confirm("Roll back " + name + " to the last good version?")) call("/api/deploys/" + d.id + "/rollback", {{}});
+  if (d) call("/api/deploys/" + d.id + "/rollback", {{}});
 }}
 </script></body></html>"""
 
