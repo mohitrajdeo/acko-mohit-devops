@@ -657,8 +657,12 @@ def api_diff(sid):
     # which commits (change history) sit between them
     r3 = run(f"git -C '{svc['repo_path']}' log --oneline {a}..{b}")
     commits = r3.stdout.strip().splitlines() if r3.stdout else []
+    # commit hashes for each version (proof of exactly which tree is running)
+    ha = run(f"git -C '{svc['repo_path']}' rev-parse {a}").stdout.strip()[:12]
+    hb = run(f"git -C '{svc['repo_path']}' rev-parse {b}").stdout.strip()[:12]
     return jsonify(frm=a, to=b, stat=stat, diff=full[:20000],
-                   commits=commits, identical=(full.strip() == ""))
+                   commits=commits, identical=(full.strip() == ""),
+                   commit_from=ha, commit_to=hb)
 
 
 @app.get("/api/services/<int:sid>/all_versions")
@@ -968,8 +972,8 @@ h2{font-size:16px;margin:4px 0 8px}
 <button onclick=location.href="/diff">Open full diff viewer</button>
 </div>
 <div class=cols>
-<div class="col stg"><h2 style=color:#1a6ec0>STAGING <span id=stg-port></span></h2><div id=stg>…</div></div>
-<div class="col prd"><h2 style=color:green>PRODUCTION <span id=prd-port></span></h2><div id=prd>…</div></div>
+<div class="col stg"><h2 style=color:#1a6ec0>STAGING <span id=stg-port></span></h2><div id=stg-head></div><div id=stg>…</div></div>
+<div class="col prd"><h2 style=color:green>PRODUCTION <span id=prd-port></span></h2><div id=prd-head></div><div id=prd>…</div></div>
 </div>
 <div class=card id=diffbox><h2>Diff between what runs in staging vs prod</h2><div id=dd>…</div></div>
 <script>
@@ -993,6 +997,7 @@ async function load(){
     const live = rows.find(d=>d.status==="healthy");
     document.getElementById(env==="staging"?"stg-port":"prd-port").textContent =
       "→ http://localhost:" + port(env);
+    const head = document.getElementById(env==="staging"?"stg-head":"prd-head");
     return `<table><tr><th>at</th><th>version</th><th>status</th></tr>
       ${rows.map(d=>`<tr><td>${(d.finished_at||"").slice(11,16)||""}</td>
       <td>${d.version}${d.status==="healthy"?' <span class=badge>live</span>':""}</td>
@@ -1003,6 +1008,19 @@ async function load(){
   };
   stg.innerHTML = box("staging");
   prd.innerHTML = box("prod");
+  // env mode + version + commit hash banner per column
+  const banner = async (env, elId) => {
+    const live = mine.filter(d=>d.environment===env&&d.status==="healthy")[0];
+    const el = document.getElementById(elId);
+    if (!live){ el.innerHTML = "<small>env mode: <b>IDLE</b> — nothing deployed</small>"; return; }
+    const d = await (await fetch(`/api/services/${sid}/diff?from=${live.version}&to=${live.version}`,{headers:H})).json();
+    el.innerHTML = `<small>env mode: <b style=color:#1a3c6e>${env.toUpperCase()}</b> ·
+      version: <b>${live.version}</b> ·
+      commit: <code>${d.commit_from||"?"}</code> ·
+      running at http://localhost:${port(env)}</small>`;
+  };
+  banner("staging", "stg-head");
+  banner("prod", "prd-head");
   // diff between live staging and live prod versions
   const live = env => mine.filter(d=>d.environment===env&&d.status==="healthy")[0]?.version;
   const a = live("staging"), b = live("prod");
@@ -1010,7 +1028,8 @@ async function load(){
   if (!a || !b){ dd.innerHTML = "<i>need a healthy version in both envs to diff</i>"; return; }
   if (a === b){ dd.innerHTML = `<span class=badge>identical</span> both environments run <b>${a}</b> — same bits everywhere.`; return; }
   const d = await (await fetch(`/api/services/${sid}/diff?from=${b}&to=${a}`,{headers:H})).json();
-  dd.innerHTML = `<p>prod runs <b style=color:green>${b}</b>, staging runs <b style=color:#1a6ec0>${a}</b> — physical difference:</p>
+  dd.innerHTML = `<p>prod runs <b style=color:green>${b}</b> (commit <code>${d.commit_from||"?"}</code>),
+    staging runs <b style=color:#1a6ec0>${a}</b> (commit <code>${d.commit_to||"?"}</code>) — physical difference:</p>
     <pre>${(d.diff||d.stat||"").split("\n").map(colorize).join("\n")}</pre>
     <p><small>commits: ${(d.commits||[]).join(" · ")||"same commit"}</small></p>`;
 }
