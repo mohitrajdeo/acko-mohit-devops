@@ -640,6 +640,27 @@ def api_build_log(bid):
     return jsonify(log=b["log"])
 
 
+@app.get("/api/services/<int:sid>/diff")
+def api_diff(sid):
+    """Physical proof of what changed between two versions: git diff."""
+    with db() as c:
+        svc = c.execute("SELECT * FROM services WHERE id=?", (sid,)).fetchone()
+    if not svc:
+        return jsonify(error="no such service"), 404
+    a, b = request.args.get("from"), request.args.get("to")
+    if not a or not b:
+        return jsonify(error="from and to query params required"), 400
+    r = run(f"git -C '{svc['repo_path']}' diff {a} {b} --stat")
+    stat = r.stdout or r.stderr
+    r2 = run(f"git -C '{svc['repo_path']}' diff {a} {b}")
+    full = r2.stdout or r2.stderr
+    # which commits (change history) sit between them
+    r3 = run(f"git -C '{svc['repo_path']}' log --oneline {a}..{b}")
+    commits = r3.stdout.strip().splitlines() if r3.stdout else []
+    return jsonify(frm=a, to=b, stat=stat, diff=full[:20000],
+                   commits=commits, identical=(full.strip() == ""))
+
+
 @app.get("/api/services/<int:sid>/all_versions")
 def api_all_versions(sid):
     """Every deployable version: git tags + versions we built before (deduped)."""
@@ -907,6 +928,11 @@ def ui():
     return LOGIN_PAGE
 
 
+@app.get("/diff")
+def diff_ui():
+    return DIFF_PAGE
+
+
 @app.get("/admin")
 def admin_ui():
     return ADMIN_PAGE
@@ -915,6 +941,79 @@ def admin_ui():
 @app.get("/dashboard")
 def dashboard_ui():
     return DASH_PAGE
+
+
+DIFF_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — version diff</title>
+<style>
+body{font-family:ui-monospace,monospace;background:#f0f2f5;margin:20px}
+.card{background:#fff;border:1px solid #d8d8d8;border-radius:8px;padding:16px;margin-bottom:14px}
+select,input{padding:6px;margin:0 8px}
+h1{color:#1a3c6e;font-size:20px}
+h2{font-size:15px;margin:10px 0 6px}
+pre{background:#0d1117;color:#e6edf3;padding:12px;border-radius:6px;overflow:auto;white-space:pre;font-size:12px}
+.add{color:#3fb950}.del{color:#f85149}
+table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 10px;font-size:13px}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;color:#fff}
+.good{background:green}.bad{background:#c0392b}.unknown{background:#888}
+</style></head><body>
+<h1>Launchpad — what physically changed between versions</h1>
+<div class=card>
+<b>Service</b> <select id=svc></select>
+<b>From</b> <select id=frm></select>
+<b>To</b> <select id=to></select>
+<button onclick=show() style="background:#1a3c6e;color:#fff;padding:7px 16px;border:none;border-radius:5px;cursor:pointer">Show diff</button>
+<span id=status style=margin-left:10px></span>
+</div>
+<div class=card id=out>pick two versions…</div>
+<script>
+const H = {"X-Session": localStorage.getItem("lp_session")};
+async function init(){
+  const svcs = await (await fetch("/api/services",{headers:H})).json();
+  svc.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name}</option>`).join("");
+  await fillVers();
+  svc.onchange = fillVers;
+  show();
+}
+async function fillVers(){
+  const id = svc.value;
+  const v = await (await fetch("/api/services/"+id+"/all_versions",{headers:H})).json();
+  const deploys = await (await fetch("/api/deploys",{headers:H})).json();
+  const good = new Set(), bad = new Set();
+  for (const d of deploys){
+    if (d.service_id != id) continue;
+    if (d.status === "healthy") good.add(d.version);
+    else if (["failed","rolled_back","rollback_failed"].includes(d.status)) bad.add(d.version);
+  }
+  const badge = t => good.has(t) ? ' <span class="badge good">good</span>'
+                 : bad.has(t) ? ' <span class="badge bad">bad</span>' : "";
+  const opts = (v.all||[]).map(x=>`<option>${x}</option>`).join("");
+  frm.innerHTML = opts; to.innerHTML = opts;
+  [...frm.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
+  [...to.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
+  if (to.options.length>1) to.selectedIndex = 1;
+}
+function esc(t){return t.replace(/&/g,"&amp;").replace(/</g,"&lt;")}
+function colorize(line){
+  if (line.startsWith("+") && !line.startsWith("+++")) return '<span class=add>'+esc(line)+'</span>';
+  if (line.startsWith("-") && !line.startsWith("---")) return '<span class=del>'+esc(line)+'</span>';
+  return esc(line);
+}
+async function show(){
+  const id = svc.value, a = frm.value, b = to.value;
+  if (!a || !b || a===b){ out.innerHTML = "<i>pick two different versions</i>"; return; }
+  const d = await (await fetch(`/api/services/${id}/diff?from=${a}&to=${b}`,{headers:H})).json();
+  if (d.error){ out.textContent = d.error; return; }
+  status.innerHTML = d.identical
+    ? '<span class="badge good" style=background:green>identical content — same code</span>'
+    : `<b style=color:#1a3c6e>${a} → ${b}</b> — real git diff of the checked-out source`;
+  out.innerHTML = `
+    <h2>Commits between ${a} and ${b}</h2>
+    ${d.commits.length ? `<table>${d.commits.map(c=>`<tr><td>${esc(c)}</td></tr>`).join("")}</table>` : "<i>none — same commit (tags point at the same tree)</i>"}
+    <h2>Files changed</h2><pre>${esc(d.stat) || "no file changes"}</pre>
+    <h2>Full diff (proof)</h2><pre>${d.diff ? d.diff.split("\n").map(colorize).join("\n") : "no content changes"}</pre>`;
+}
+init();
+</script></body></html>"""
 
 
 LOGIN_PAGE = """<!doctype html><html><head><meta charset=utf-8><title>Launchpad — sign in</title><style>
@@ -1000,39 +1099,9 @@ async function rb(name, did, sid){
   await fetch("/api/deploys/"+did+"/rollback",{method:"POST",headers:{...H,"Content-Type":"application/json"},body:JSON.stringify({version:v})});
   load();
 }
-async function loadActions(){
-  const svcs = await (await fetch("/api/services",{headers:H})).json();
-  const deploys = await (await fetch("/api/deploys",{headers:H})).json();
-  const sel = document.getElementById("act-svc");
-  if (!sel.options.length)
-    sel.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name}</option>`).join("");
-  const sid = sel.value;
-  const vers = await (await fetch("/api/services/"+sid+"/all_versions",{headers:H})).json();
-  const everHealthy = new Set(), everBad = new Set();
-  for (const d of deploys) {
-    if (d.service_id != sid) continue;
-    if (d.status === "healthy") everHealthy.add(d.version);
-    else if (["failed","rolled_back","rollback_failed"].includes(d.status)) everBad.add(d.version);
-  }
-  document.getElementById("act-ver").innerHTML =
-    (vers||[]).map(v=>{
-      const tag = everHealthy.has(v) ? " (good)" : everBad.has(v) ? " (bad)" : "";
-      return `<option value="${v}" style="color:${everHealthy.has(v)?"green":"#b35400"}">${v}${tag}</option>`;
-    }).join("") || "<option>no versions — build one first</option>";
-  sel.onchange = loadActions;
-}
-async function actDeploy(){
-  const sid = document.getElementById("act-svc").value;
-  const v = document.getElementById("act-ver").value;
-  const env = document.getElementById("act-env").value;
-  if (!v || v.startsWith("no versions")) { alert("No versions yet — build one first."); return; }
-  await fetch("/api/services/"+sid+"/deploy",{method:"POST",
-    headers:{...H,"Content-Type":"application/json"},
-    body:JSON.stringify({version:v,environment:env})});
-  load();
+load();
 }
 load();
-loadActions();
 </script></body></html>"""
 
 
@@ -1048,15 +1117,6 @@ button{padding:4px 10px;cursor:pointer}
 <div class=top><h1>Launchpad — admin console</h1><div><span id=who></span>
 <button onclick='location.href="/"'>Switch user</button>
 <button onclick=runPreflight()>Re-run control-plane checks</button></div></div>
-<div class=card style="margin-bottom:16px"><h2>Actions</h2>
-<table style=width:100%><tr>
-<td><b>Service</b><br><select id=act-svc style="width:100%"></select></td>
-<td><b>Version (good/bad)</b><br><select id=act-ver style="width:100%"></select></td>
-<td><b>Environment</b><br><select id=act-env style="width:100%">
-  <option value=staging>staging</option><option value=prod>prod</option></select></td>
-<td style="vertical-align:bottom"><button onclick=actDeploy() style="background:#1a3c6e;color:#fff;padding:8px 18px">Deploy / switch</button></td>
-</tr></table><small>Pick a version — (good) ever passed the health gate, (bad) always failed. Deploying switches the running version.</small>
-</div>
 <div class=grid>
 <div class=card style=min-width:340px><h2>Control plane</h2><div id=cp>checking…</div></div>
 <div class=card style=min-width:340px><h2>Resources</h2><div id=res>checking…</div></div>
@@ -1111,17 +1171,19 @@ async function load(){
 
   // delivery metrics: per service bars for failure%, deploys/day, MTTR, lead time
   const m = await (await fetch("/api/metrics",{headers:H})).json();
-  const row = (label, val, pct, color, sub) =>
-    `<div style="margin-top:4px"><small><b>${label}</b> ${sub}</small>
-     <div style="background:#e0e4ea;border-radius:3px;height:8px;width:100%">
-     <div style="background:${color};height:8px;width:${Math.min(pct,100)}%;border-radius:3px"></div></div></div>`;
+  const row = (label, pct, color, sub) =>
+    `<div style="margin:3px 0"><small style=color:#555>${label}</small>
+      <span style="display:inline-block;background:#e0e4ea;border-radius:2px;height:6px;width:120px;vertical-align:middle;margin:0 6px">
+      <span style="display:inline-block;background:${color};height:6px;width:${Math.min(pct,100)}%;border-radius:2px"></span></span>
+      <small>${sub}</small></div>`;
   mets.innerHTML = (m||[]).map(x => {
     const fp = x.deploy_failure_pct ?? 0;
-    return `<div style="margin-bottom:8px"><b>${x.service}</b>
-      ${row("failure %", "", fp, fp>30?"#c0392b":"#b35400", `— ${fp}% of ${x.deploys_total} deploys`)}
-      ${row("deploys/day", "", Math.min(100,(x.deploys_per_day??0)*5), "green", `— ${x.deploys_per_day}`)}
-      ${x.mttr_minutes!=null ? row("MTTR", "", Math.min(100, x.mttr_minutes*100), "#1a6ec0", `— ${x.mttr_minutes} min`) : ""}
-      ${x.lead_time_to_prod_minutes!=null ? row("lead time to prod", "", Math.min(100, x.lead_time_to_prod_minutes), "#7b52a8", `— ${x.lead_time_to_prod_minutes} min`) : ""}
+    return `<div style="margin-bottom:5px;padding-bottom:4px;border-bottom:1px solid #f0f0f0">
+      <small><b>${x.service}</b> (${x.deploys_total} deploys)</small>
+      ${row("fail%", fp, fp>30?"#c0392b":"#b35400", `${fp}%`)}
+      ${row("d/day", Math.min(100,(x.deploys_per_day??0)*5), "green", `${x.deploys_per_day}`)}
+      ${x.mttr_minutes!=null ? row("MTTR", Math.min(100, x.mttr_minutes*100), "#1a6ec0", `${x.mttr_minutes}m`) : ""}
+      ${x.lead_time_to_prod_minutes!=null ? row("lead", Math.min(100, x.lead_time_to_prod_minutes), "#7b52a8", `${x.lead_time_to_prod_minutes}m`) : ""}
     </div>`;
   }).join("");
 

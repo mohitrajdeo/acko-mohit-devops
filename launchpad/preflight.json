@@ -1,5 +1,5 @@
 {
-  "at": "2026-11-18T15:16:01",
+  "at": "2026-11-18T15:19:37",
   "total": 13,
   "failed": 0,
   "results": [
@@ -41,7 +41,7 @@
     {
       "check": "staging port for service 3",
       "ok": true,
-      "detail": "port 8103 in use by managed container lp-acceptance-svc-staging (expected)"
+      "detail": "port 8103 free"
     },
     {
       "check": "prod port for service 3",
