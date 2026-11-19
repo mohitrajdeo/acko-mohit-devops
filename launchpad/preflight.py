@@ -51,7 +51,9 @@ def disk_space():
 def disk_inode_ok():
     r = subprocess.run("df -i / | tail -1", shell=True, capture_output=True, text=True)
     try:
-        pct = int(r.stdout.split()[-1].rstrip("%"))
+        parts = r.stdout.split()
+        pct_str = parts[-2] if len(parts) >= 2 else parts[-1]
+        pct = int(pct_str.rstrip("%"))
         return pct < 90, f"{pct}% inodes used"
     except (ValueError, IndexError):
         return True, "unknown"
@@ -87,7 +89,7 @@ def port_free(host_port):
 
 
 def git_identity():
-    r = subprocess.run("git config --global user.name", shell=True,
+    r = subprocess.run("git config user.name", shell=True,
                        capture_output=True, text=True)
     return bool(r.stdout.strip()), r.stdout.strip() or "git user.name not set"
 

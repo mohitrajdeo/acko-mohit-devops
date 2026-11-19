@@ -97,10 +97,6 @@ Data model (SQLite):
 - `deploys(id, service_id, version, environment, status, started_at, finished_at)`
 - `events(id, deploy_id, type, detail, created_at)`  ← the audit trail / incident timeline
 - `configs(id, service_id, environment, key, value)`
-- `pointers(service_id, environment, version, container)` — the live version per
-  (service × environment); added during the build as the single source of truth
-  for "what is running" (dashboards read it; rollback = a pointer move)
-- `users` / `sessions` — demo auth (first user = manager; teams scoped views)
 
 "Last good version" = the version of the most recent deploy that passed the health gate.
 
@@ -120,16 +116,10 @@ Data model (SQLite):
 - Mean time from broken deploy → healthy again (MTTR) — target: < 60s
 - Health-gate detection time (deploy finish → rollback decision)
 - Ship frequency per service (deploys/day)
-- Lead time to production — median time from a version's first staging deploy to
-  its first prod deploy (added to close must-have #9's full wording)
-- Control-plane resources (CPU/RAM/disk) — surfaced in the manager console
+- Build duration trend
 
 ## Screens (HTML, minimal)
 
 1. Dashboard — services, what's running where, recent events
 2. Service page — builds, deploys, config per env, deploy/rollback buttons
 3. Metrics page — the delivery metrics above
-4. Admin console — all teams, control-plane health + resource monitor,
-   failures/24h, per-team detail, deploy-to-staging / push-to-production
-5. `/envs` — staging vs prod side by side (version, commit hash, ports, live diff)
-6. `/diff` — git diff between any two versions (physical proof of change)

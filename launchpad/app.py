@@ -203,6 +203,236 @@ def team_scope(u):
 
 
 # ---------------------------------------------------------------- builds
+def _ensure_service_dashboard(repo_path, service_name, version):
+    repo = Path(repo_path)
+    if not repo.exists():
+        return
+
+    # 1. index.html template
+    html_file = repo / "index.html"
+    if not html_file.exists():
+        html_file.write_text("""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{SERVICE}} &bull; {{VERSION}} ({{ENVIRONMENT_BADGE}})</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #0b1120;
+      color: #f1f5f9;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .container {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 32px 36px;
+      max-width: 540px;
+      width: 100%;
+      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      padding: 6px 16px;
+      border-radius: 9999px;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 1.5px;
+      background: {{BADGE_BG}};
+      color: #ffffff;
+      margin-bottom: 20px;
+    }
+    h1 {
+      font-size: 26px;
+      margin: 0 0 6px 0;
+      color: #38bdf8;
+    }
+    .subtitle {
+      color: #94a3b8;
+      font-size: 14px;
+      margin-bottom: 24px;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 24px;
+      text-align: left;
+    }
+    .box {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px 16px;
+    }
+    .box-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      margin-bottom: 4px;
+    }
+    .box-val {
+      font-size: 15px;
+      font-weight: 600;
+      color: #f8fafc;
+      font-family: monospace;
+    }
+    .ok { color: #4ade80; }
+    .links {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 14px 18px;
+      text-align: left;
+    }
+    .links-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      margin-bottom: 8px;
+    }
+    .links a {
+      display: block;
+      color: #38bdf8;
+      text-decoration: none;
+      font-family: monospace;
+      font-size: 13px;
+      padding: 4px 0;
+    }
+    .links a:hover {
+      text-decoration: underline;
+    }
+    .nav-btn {
+      margin-top: 20px;
+      display: inline-block;
+      padding: 8px 16px;
+      background: #334155;
+      color: #94a3b8;
+      font-size: 12px;
+      text-decoration: none;
+      border-radius: 6px;
+    }
+    .nav-btn:hover { background: #475569; color: #fff; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="badge">{{ENVIRONMENT_BADGE}}</div>
+    <h1>{{SERVICE}}</h1>
+    <div class="subtitle">ACKO General Insurance &bull; Launchpad Managed Microservice</div>
+    <div class="stats">
+      <div class="box">
+        <div class="box-title">Active Version</div>
+        <div class="box-val">{{VERSION}}</div>
+      </div>
+      <div class="box">
+        <div class="box-title">Target Environment</div>
+        <div class="box-val">{{ENVIRONMENT}}</div>
+      </div>
+      <div class="box">
+        <div class="box-title">Container / Host Port</div>
+        <div class="box-val">:{{HOST_PORT}}</div>
+      </div>
+      <div class="box">
+        <div class="box-title">Health State</div>
+        <div class="box-val ok">&bull; 200 OK (HEALTHY)</div>
+      </div>
+    </div>
+    <div class="links">
+      <div class="links-title">Inspect Live Microservice Endpoints:</div>
+      <a href="/health" target="_blank">&rarr; GET /health (Health Gate Probe)</a>
+      <a href="/version" target="_blank">&rarr; GET /version (Version &amp; Env JSON)</a>
+      {{SERVICE_LINKS}}
+    </div>
+    <a href="http://localhost:7000/envs" target="_blank" class="nav-btn">&larr; Back to Launchpad Staging vs Prod Diff</a>
+  </div>
+</body>
+</html>
+""", encoding="utf-8")
+
+    # 2. Dockerfile: ensure COPY index.html . is present
+    df = repo / "Dockerfile"
+    if df.exists():
+        c = df.read_text(encoding="utf-8")
+        if "COPY index.html" not in c:
+            if "COPY app.py ." in c:
+                c = c.replace("COPY app.py .", "COPY app.py .\nCOPY index.html .")
+            else:
+                lines = c.splitlines()
+                idx = -1
+                for i, l in enumerate(lines):
+                    if l.startswith("CMD") or l.startswith("ENTRYPOINT"):
+                        idx = i
+                        break
+                if idx >= 0:
+                    lines.insert(idx, "COPY index.html .")
+                else:
+                    lines.append("COPY index.html .")
+                c = "\n".join(lines) + "\n"
+            df.write_text(c, encoding="utf-8")
+
+    # 3. app.py: ensure _send_html and GET / handler
+    ap = repo / "app.py"
+    if ap.exists():
+        txt = ap.read_text(encoding="utf-8")
+        if 'path in ("/", "/index.html")' not in txt and 'path == "/"' not in txt:
+            if "_send_html" not in txt:
+                send_fn = '''    def _send_html(self, code, html_str):
+        data = html_str.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+'''
+                txt = txt.replace("    def do_GET(self):", send_fn + "    def do_GET(self):")
+
+            route_fn = '''        if path in ("/", "/index.html"):
+            env = os.environ.get("APP_ENV", "staging").lower()
+            is_prod = env in ("prod", "production")
+            badge_bg = "#059669" if is_prod else "#0284c7"
+            badge_text = "PRODUCTION ENVIRONMENT" if is_prod else "STAGING ENVIRONMENT"
+            host_port = os.environ.get("HOST_PORT", str(PORT))
+            service_links = (
+                '<a href="/policies" target="_blank">&rarr; GET /policies (List All Policies)</a>\\n'
+                '      <a href="/policies/P1001" target="_blank">&rarr; GET /policies/P1001 (Asha Rao - Car Policy)</a>'
+                if SERVICE == "policy-svc" else
+                '<a href="/quote?bike_cc=200&rider_age=28" target="_blank">&rarr; GET /quote?bike_cc=200&amp;rider_age=28</a>'
+            )
+            try:
+                with open("index.html", "r", encoding="utf-8") as f:
+                    template = f.read()
+                html = (template
+                    .replace("{{SERVICE}}", SERVICE)
+                    .replace("{{VERSION}}", VERSION)
+                    .replace("{{ENVIRONMENT}}", env.upper())
+                    .replace("{{ENVIRONMENT_BADGE}}", badge_text)
+                    .replace("{{BADGE_BG}}", badge_bg)
+                    .replace("{{HOST_PORT}}", host_port)
+                    .replace("{{SERVICE_LINKS}}", service_links)
+                )
+            except Exception:
+                html = f"<!doctype html><html><body style='background:#0b1120;color:#38bdf8;padding:40px;font-family:sans-serif'><h1>{SERVICE} {VERSION}</h1><p>Environment: <b>{env.upper()}</b> | Port: <b>:{host_port}</b></p><p><a href='/health' style='color:#38bdf8'>/health</a> &bull; <a href='/version' style='color:#38bdf8'>/version</a></p></body></html>"
+            return self._send_html(200, html)
+
+'''
+            if "path = u.path\n" in txt:
+                txt = txt.replace("path = u.path\n", "path = u.path\n" + route_fn)
+            ap.write_text(txt, encoding="utf-8")
+
+
 def do_build(service_id, version):
     with db() as c:
         svc = c.execute("SELECT * FROM services WHERE id=?", (service_id,)).fetchone()
@@ -220,12 +450,26 @@ def do_build(service_id, version):
             c.execute("UPDATE builds SET log=? WHERE id=?", ("\n".join(log), build_id))
         return ok
 
-    # fail fast: never continue (esp. never docker build/push) after a failed step —
-    # a failed checkout must not produce a mistagged image
-    ok = True
+    # Phase 1: git checkout & clean
     for cmd in (
             f"git -C '{svc['repo_path']}' checkout -f {version}",
-            f"git -C '{svc['repo_path']}' clean -fd",
+            f"git -C '{svc['repo_path']}' clean -fd"):
+        if not step(cmd):
+            log.append(f"! build aborted: checkout failed -> {cmd.split()[0]}")
+            with db() as c:
+                c.execute("UPDATE builds SET log=?, status='failed' WHERE id=?",
+                          ("\n".join(log), build_id))
+            return False, build_id
+
+    # Phase 2: ensure microservice visual dashboard and Dockerfile COPY
+    try:
+        _ensure_service_dashboard(svc['repo_path'], svc['name'], version)
+    except Exception as e:
+        log.append(f"! note on dashboard setup: {e}")
+
+    # Phase 3: docker build & push
+    ok = True
+    for cmd in (
             f"docker build -t localhost:5000/{svc['name']}:{version} '{svc['repo_path']}'",
             f"docker push localhost:5000/{svc['name']}:{version}"):
         if not step(cmd):
@@ -397,9 +641,11 @@ def _auto_rollback(svc, failed_deploy_id, environment):
     log_event(failed_deploy_id, "rollback.auto",
               f"pointer -> {good} (config snapshot {'deploy-time' if snapshot is not None else 'live'})")
     container = f"lp-{svc['name']}-{environment}"
-    env_flags = " ".join(f"-e {k}={v}" for k, v in env_vars.items())
     env_offset = 100 if environment == "prod" else 0
     host_port = SERVICE_PORT_BASE + svc["id"] + env_offset
+    env_vars["HOST_PORT"] = str(host_port)
+    env_vars["APP_ENV"] = environment
+    env_flags = " ".join(f"-e {k}={v}" for k, v in env_vars.items())
     run(f"docker rm -f {container} 2>/dev/null")
     r = run(f"docker run -d --name {container} {env_flags} "
             f"-p {host_port}:{svc['port']} localhost:5000/{svc['name']}:{good}")

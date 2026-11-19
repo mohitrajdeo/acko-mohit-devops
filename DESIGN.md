@@ -1,157 +1,111 @@
-# Launchpad — Design Flow & System Workflow
+# Launchpad — Design and workflow
 
-> For Harish Rama Rao — walkthrough of the built product. Companion to PLAN.md.
-> Everything below is implemented and live-tested (test evidence in PROGRESS.md).
+This is a description of the current prototype and its known limitations, not a
+claim that every planned feature is complete. The original Gate 1 plan is in
+`PLAN.md`; changes and trade-offs are recorded here and in `PROGRESS.md`.
 
-## 1. What Launchpad is (one paragraph)
+## Purpose and users
 
-A small internal deployment platform: an engineer registers a service (its git repo,
-Dockerfile, port, health endpoint), picks a version (any git tag or commit), and Launchpad
-builds it into a container image, stores it in the registry, deploys it to staging or prod,
-verifies health, and automatically rolls back if the new version never becomes healthy.
-Every step announces itself to the team webhook — no silent failures. Team leads get
-delivery metrics per service: ship frequency, failure rate, and mean time to recovery.
+Launchpad gives engineers a common path to register a service, build a tagged
+version, deploy it to Docker, check health and recover from a bad deployment.
+Team leads need a view of deployments, events and delivery metrics across teams.
+The target is a laptop with one Docker daemon, not a production-grade platform.
 
-## 2. The actors
+## Architecture
 
-| Actor | What they do | Where |
-|---|---|---|
-| Engineer (team member) | Registers services, deploys versions, promotes, rolls back | Dashboard UI / REST API |
-| Team lead / manager | Watches delivery metrics + event feed (per team) | Dashboard (filterable) |
-| Launchpad itself | Builds, deploys, health-gates, rolls back, notifies | Control plane (Flask + SQLite) |
-| Webhook receiver | Stands in for team chat; receives every event | Kit's :9900 page |
-
-## 3. End-to-end flow (the main loop)
-
-```
- Engineer                Launchpad Control Plane                    Infrastructure
- ─────────               ───────────────────────                    ──────────────
-     │
- register service ────►  services row (name, repo, port, /health,
- (API or UI)             Dockerfile, team)  → webhook: service.registered
-     │
-     │  pick version
-     ▼
- "Deploy v1.1.0 ────►    1. git checkout v1.1.0 (+ clean -fd)   ──► service repo
-  to staging"            2. docker build                        ──► image
-                         3. docker push                         ──► registry :5000
-                         (full log stored per build, viewable)
-                              │
-                              ▼
-                         4. deploy: new container starts under a
-                            TEMP name (old container kept stopped,
-                            NOT removed — instant recovery path)
-                              │
-                              ▼
-                         5. HEALTH GATE: probe GET /health
-                            up to 3 × 3s (fail-fast: ~9s worst case)
-                              │
-                 ┌────────────┴────────────┐
-             200 OK                    still failing
-                 │                          │
-                 ▼                          ▼
-         promote temp→final         6. AUTO-ROLLBACK:
-         old container removed         old container restarted,
-         status = healthy              event rollback.auto,
-         webhook: deploy.healthy       webhook: deploy.rolled_back
-                                       (or failed if no good version)
-                 │
-                 ▼
- promote→prod ────────►  same gated deploy of the version
- (one action)            currently healthy in staging → :8200+id
-     │
-     ▼
- if anything goes wrong in prod: manual rollback button (any
- previously-healthy version) or automatic rollback (same gate)
+```text
+Browser (login, team dashboard, manager console)
+                 │ HTTP / JSON
+          Flask app: launchpad/app.py :7000
+           ├── SQLite: services, builds, configs, deploys,
+           │           pointers, events, users and sessions
+           ├── Git checkout → Docker build → registry :5000
+           ├── Docker container → health probe → rollback if needed
+           └── event notification → kit webhook receiver :9900
 ```
 
-## 4. What's stored (data model, SQLite)
+The kit's two local Git repositories provide Dockerfiles, health endpoints and
+tagged example versions. Build, deployment and database state are local to the
+WSL environment. `preflight.py` checks dependencies and ports.
 
-| Table | Holds | Key relationships |
-|---|---|---|
-| `services` | name, repo path, Dockerfile, port, health path, **team** | 1 → many deploys/builds/configs |
-| `builds` | version, status, **full build log**, timestamp | per service |
-| `deploys` | version, environment, status (deploying/healthy/failed/rolled_back/rejected), timestamps | per service; history = this table |
-| `events` | typed audit trail (deploy.started/.healthy/.failed, health.retry, rollback.auto/.manual, config.set…) | per deploy; feeds UI + webhook |
-| `configs` | env var per service **per environment** (staging/prod separate) | per service |
+## Build and deployment
 
-"Last good version" = the most recent deploy of that service+env with status `healthy`.
-Rollback targets = any version that ever passed the gate (UI lets you choose).
+1. Register a service with its local repo path, port, health path and team.
+2. Set environment variables separately for staging and production.
+3. Build a Git ref: checkout, clean, Docker build and registry push. The build
+   log is stored in SQLite. The pipeline stops on a failed command.
+4. Deploy an image. Staging uses `8100 + service_id`; production uses
+   `8200 + service_id`. Container names include service and environment.
+5. The old container is stopped but kept during the swap. The new container
+   receives up to three health probes, spaced three seconds apart. On failure,
+   the engine attempts to restart the old container and records the outcome;
+   if no old container exists, the deployment fails. Downtime during the swap
+   was accepted by the product owner.
+6. Promotion selects the most recent successful staging deployment in history
+   and deploys that version to production. The production health gate still
+   runs; this is not proof that staging is currently running that version.
 
-## 5. Port & container scheme (multi-team, collision-safe)
+Builds use `git checkout -f` and `git clean -fd` in the registered repository;
+these can discard local changes and untracked files. Use a disposable copy of a
+service repository. Never point the build at a working tree containing valuable
+uncommitted work.
 
-- Container name: `lp-<service>-<env>` — unique per (service × environment)
-- Host ports: **staging = 8100+service_id**, **prod = 8200+service_id**
-  → both environments of one service run side by side
-- Concurrent-deploy guard: one deploy at a time per (service, env);
-  a second simultaneous deploy is rejected with a logged `deploy.rejected` event
-- Teams: every service carries a team field; the event feed is filterable
-  by team/service so a manager sees only what matters to them
+## State and history
 
-## 6. Notifications — no silent failures
+| Data | Purpose |
+|---|---|
+| `services`, `builds` | Service metadata, version builds and build logs |
+| `configs` | Variables for each service/environment |
+| `deploys` | Version, environment, status, timestamps and config snapshot |
+| `pointers` | Recorded version/container per service and environment |
+| `events` | Deployment and notification history |
+| `users`, `sessions` | Demonstration accounts and session tokens |
 
-Every state change POSTs to the webhook receiver with a typed event:
+Pointers are recorded on successful deployment. The admin page falls back to
+deployment history if there is no pointer; this fallback is history, not proof
+of what is currently running. Snapshots are stored, but manual rollback should
+not be presented as a proven arbitrary-version or snapshot-restoration feature:
+the current rollback endpoint selects an earlier healthy deployment and ignores
+the version supplied by the UI.
 
-| Event | Meaning | Severity for real chat routing |
-|---|---|---|
-| `service.registered` | new service added | info |
-| `deploy.started` | rollout begun | info |
-| `deploy.healthy` | new version passed the gate | info |
-| `deploy.failed` | docker/run failure (old version restored) | **alert** |
-| `health.retry` / `health.gate_failed` | gate progress / gate lost | warn → **alert** |
-| `rollback.auto` / `deploy.rolled_back` | prod auto-restored to last good | **alert** |
-| `deploy.rejected` | concurrent deploy blocked | warn |
-| `config.set` | env var changed | info |
+## Views and observability
 
-(Open PO question: shared vs personalized views + who receives alert-tier events.)
+- `/` signs in; `/dashboard` is the team view; `/admin` is the manager view.
+  The admin overview has team cards, recent deployments/events and resource and
+  delivery-metric displays. Demo users are `admin`, `team1`, `team2` with `1234`.
+- `/envs` and `/diff` were added as comparison views, but browser testing found
+  JavaScript syntax errors. Treat them as **not working until fixed and tested**.
+- Events are stored and notifications are sent to the local webhook receiver.
+  Delivery is best effort; do not claim guaranteed notification delivery.
+- A background watchdog checks the Docker state of containers referenced by
+  pointers every 60 seconds and reports `service.down` once per outage. It does
+  not probe application health or perform recovery. Severity for this event is
+  not explicitly configured as alert in the current severity map.
+- Resource figures describe the WSL host. CPU is a cumulative average since
+  boot, not a current-interval utilization sample; RAM and disk are host figures.
 
-## 7. Screens (dashboard, localhost:7000)
+## Metrics and concurrency
 
-1. **Services — what's running where**: per service row: team, state
-   (healthy/failed/rolled_back/never deployed), current version + env,
-   inline delivery metrics (deploys · failure% · MTTR), and buttons:
-   **Deploy** (version picker fed by real git tags + env prompt),
-   **Promote→prod**, **Rollback** (choose among healthy versions)
-2. **Recent events**: typed feed with service/team filter, auto-refresh
+The metrics endpoint computes deployments per day, failure percentage, an
+approximate recovery time, and median time from the first staging deployment
+start to the first production deployment start for the same version. This is a
+staging-to-production proxy, not commit-to-production lead time. Historical
+results can include failed attempts.
 
-## 8. Delivery metrics (the manager view)
+Concurrent deployments for the same service/environment wait up to 180 seconds
+and emit queue events. This is an in-process polling mechanism, not a durable,
+fair or multi-process deployment queue.
 
-Per service, computed from real history:
-- **Ship frequency** — deploys per day
-- **Deploy failure rate** — % of deploys that failed or were rolled back
-- **MTTR** — mean time from broken deploy to healthy again
-  (our live test: broken prod deploy → auto-rollback restored in **0.3 min**)
-- Current state / what's running where right now
+## Product-owner decisions and boundaries
 
-## 9. Live-proven scenarios (demo script)
+The conversation records that the product owner accepted downtime and allowed
+staging. A shared demo view was accepted; team grouping and a cross-team admin
+view were proposed, without a recorded final confirmation of that proposal.
+See `DECISIONS.md` for the earlier decision log; it contains some historical
+statements that predate later changes.
 
-1. Register policy-svc (team `policy`) → webhook shows it
-2. Set prod config (`DB_PASSWORD`) → try promote without it → **platform refuses**
-   (missing secret = unhealthy gate) → set config → promote succeeds
-3. Deploy healthy v1.0.0 → 200 at the mapped port → `deploy.healthy`
-4. Deploy **broken** v1.2.0 to prod → probes fail → **auto-rollback** restores v1.0.0
-   → full event story on the webhook page, MTTR recorded in metrics
-5. Fire two deploys for the same service+env simultaneously → second is
-   **queued** (deploy queue, waits its turn with queued/dequeued events)
-   rather than rejected; completes cleanly
-6. One-click manual rollback from the dashboard to any healthy version
-   (dropdown of healthy versions only, no confirmation popup)
-7. **Stop a running container** → watchdog detects it within 60s →
-   one-time `service.down` **alert** webhook
-8. **`/envs` page**: staging vs prod of the same service side by side —
-   env mode, version, commit hash (`git rev-parse`), ports (staging
-   8100+id / prod 8200+id) — plus the live git diff between the versions
-   each environment runs (physical proof of what a version change contains)
-9. **`/diff` page**: pick any two versions → commits between them, files
-   changed, full colorized git diff
-10. Manager console (`/admin`): live **CPU/RAM/disk** bars of the control
-    plane, failures/24h + delivery metrics as bar graphs, per-team cards,
-    separate **Deploy to staging** / **Push to production** buttons
-
-## 10. Known limits / next steps (also in DECISIONS.md)
-
-- Port conflict from stale containers surfaces as a docker error today —
-  plan: pre-check + clear error before binding (in progress)
-- No user accounts yet (PO question pending); team field is the foundation
-- One Docker daemon, SQLite: laptop-scale by design; next steps would be a
-  deploy queue, periodic post-deploy health re-checks, Kubernetes target
+Demo authentication and authorization are incomplete: several API mutations do
+not enforce sessions or team ownership. Secrets are stored in SQLite, and Git
+and Docker commands use shell strings. Use only in a trusted local demo, not as
+a production service. Kubernetes, canary deployments, strong isolation and
+zero-downtime deployment are outside this prototype.

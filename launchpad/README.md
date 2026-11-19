@@ -1,196 +1,112 @@
-# Launchpad — a mini deployment platform
+# Launchpad — mini deployment platform
 
-Deploy a version, check it is healthy, roll back in one click if it isn't.
-Every step announces itself on a webhook — no silent failures.
+Launchpad is a local Flask/SQLite prototype for registering a service, building
+a Git version into Docker, deploying it to staging or production, health-gating
+the replacement and attempting automatic recovery. It uses the Acko starter
+kit's local image registry and webhook receiver.
 
-## What it does
+**Status:** a previous acceptance run reported 15/15, but the current product
+has important known gaps below. It is not ready for production. This README is
+available both at the repository root and in `launchpad/`.
 
-- **Service registry** — register a service (name, git repo, Dockerfile, port, health
-  endpoint, owning team) via API or UI.
-- **Build** — pick any git tag or commit → Launchpad checks it out (pristine
-  `checkout -f` + `clean -fd`), builds the image, pushes it to the local registry,
-  and stores the full build log (viewable).
-- **Deploy** — runs the image in Docker; staging and prod run side by side
-  (staging = 8100+service_id, prod = 8200+service_id).
-- **Health gate + auto-rollback** — after deploy, up to 3 probes × 3s on `GET /health`.
-  Never healthy → the previous container is restored automatically and the failure is
-  classified (`never_started` / `startup_unreachable` / `never_healthy`) and recorded.
-- **Environments + promotion** — one-click promote of the currently-healthy staging
-  version to prod. Prod requires its own config (a deploy without it is refused by
-  the health gate — proven live).
-- **Manual rollback** — one click to any version that ever passed the health gate;
-  rollback is a **pointer move** (no rebuild), guarded by deploy-time config snapshots.
-- **Configuration** — env vars per service per environment, snapshotted per deploy.
-- **Delivery metrics** — deploys/day, deploy failure %, MTTR, lead time to prod.
-- **Control-plane preflight** — 13 checks (docker, registry, webhook, disk, ports,
-  db) surfaced as a green/red banner; standalone via `python3 preflight.py`.
-- **Teams & auth** — shared view without a session (read-only); login scopes
-  engineer views to their team; `admin` (manager) gets a cross-team console with
-  control-plane health, failures/24h, and per-team detail (last 5 deploys/events).
-- **Concurrent-deploy guard** — one deploy at a time per (service, environment);
-  a second simultaneous deploy is rejected with a logged event.
+## Requirements
 
-## Quick start
+- Linux/WSL2, Docker Engine with Compose, Git and Python 3.10+ with Flask.
+- The Launchpad starter kit extracted with its original local Git repositories
+  and tags. A plain Git clone may not contain nested repositories' refs: check
+  that `quote-svc` and `policy-svc` are Git repos and have their original tags.
+- Ports 5000 (registry), 9900 (webhook receiver), 7000 (control plane), and
+  per-service ports in the 8100/8200 ranges available.
 
-Prereqs: Docker (with compose), Python 3.10+, git. All commands inside WSL2 on Windows.
+Run commands inside WSL. The example assumes a clone at `~/acko-mohit-devops`.
+Windows is used for viewing; do not overwrite WSL changes with an old Windows
+copy. **Builds run `git checkout -f` and `git clean -fd` on the registered repo:**
+use disposable service repo copies, not repositories with uncommitted work.
+
+## Start from scratch (One-Command Startup)
 
 ```bash
-# 1. start the kit (registry :5000 + webhook receiver :9900)
-cd ~/acko-mohit-devops/devops-startup-kit/launchpad-starter-kit/launchpad-starter-kit
-docker compose up --build -d
-
-# 2. start the control plane (:7000)
-cd ~/acko-mohit-devops/launchpad
-pip3 install --break-system-packages flask   # first time only
-bash restart.sh                              # runs app.py on :7000
-
-# 3. seed demo accounts + teams (one time)
-curl -s -X POST localhost:7000/api/admin/seed -H 'Content-Type: application/json' -d '{}'
-
-# 4. open http://localhost:7000 and sign in
-#    admin  / 1234  -> manager console (/admin)
-#    team1  / 1234  -> team dashboard
-#    team2  / 1234  -> team dashboard
-#    (no login = shared read-only view of everything)
+bash start.sh
 ```
 
-## First-run demo script (5 minutes)
+`start.sh` automatically checks Docker, starts the local registry (`:5000`) and webhook receiver (`:9900`), verifies Flask, auto-seeds default demo credentials, and boots the Launchpad control plane (`:7000`).
 
-```bash
-# register a service (adjust repo path if needed)
-curl -s -X POST localhost:7000/api/services -H 'Content-Type: application/json' \
-  -d '{"name":"quote-svc","repo_path":"'$HOME'/acko-mohit-devops/devops-startup-kit/launchpad-starter-kit/launchpad-starter-kit/services/quote-svc","port":8080,"team":"team1"}'
+Open <http://localhost:7000/>. Demo credentials:
+- **Manager**: `admin` / `1234` (Full access at `/admin`)
+- **Team 1**: `team1` / `1234` (Team dashboard at `/dashboard`)
+- **Team 2**: `team2` / `1234` (Team dashboard at `/dashboard`)
 
-# config is required or the service reports unhealthy (this is the rollback trigger)
-curl -s -X POST localhost:7000/api/services/1/config -H 'Content-Type: application/json' \
-  -d '{"environment":"staging","key":"DB_PASSWORD","value":"stg-secret"}'
+Check <http://localhost:9900/> for received webhook notifications.
 
-# build + deploy a good version
-curl -s -X POST localhost:7000/api/services/1/build  -H 'Content-Type: application/json' -d '{"version":"v1.1.0"}'
-curl -s -X POST localhost:7000/api/services/1/deploy -H 'Content-Type: application/json' -d '{"version":"v1.1.0","environment":"staging"}'
-sleep 12 && curl -s localhost:8101/version    # running
+## Demonstration
 
-# deploy the BROKEN version -> watch auto-rollback (probes fail -> previous restored)
-curl -s -X POST localhost:7000/api/services/1/build  -H 'Content-Type: application/json' -d '{"version":"v1.2.0"}'
-curl -s -X POST localhost:7000/api/services/1/deploy -H 'Content-Type: application/json' -d '{"version":"v1.2.0","environment":"staging"}'
-sleep 14 && curl -s localhost:7000/api/deploys | python3 -m json.tool | head -20
+Use the API or available UI to register a service, set staging and production
+config, build a real kit tag, and deploy it. For the acceptance scenario run the
+test below: it builds `v1.1.0`, deploys to staging, builds/deploys broken
+`v1.2.0`, then checks rollback, metrics and a webhook event. The starter services
+require appropriate `DB_PASSWORD` configuration. The script uses an
+`acceptance-svc` registration and calculates the staging port as `8100 + id`.
 
-# see the full event story + structured payloads
-xdg-open http://localhost:9900   # webhook receiver page (or open in a browser)
-```
-
-Or do all of it from the UI: Deploy (version dropdown → env dropdown),
-Promote→prod, Rollback (healthy versions only).
-
-## API
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/services` | register service (name, repo_path, port, team, …) |
-| GET | `/api/services` | list services |
-| POST | `/api/services/<id>/config` | set env var for an environment |
-| POST | `/api/services/<id>/build` | build a tag/commit, push to registry, save log |
-| POST | `/api/services/<id>/deploy` | deploy a version to staging/prod (gated) |
-| POST | `/api/services/<id>/promote` | promote healthy staging version to prod |
-| POST | `/api/deploys/<id>/rollback` | manual rollback to a given good version |
-| GET | `/api/deploys` | deployment history (team-scoped with session) |
-| GET | `/api/events?service=&team=` | audit trail (filterable, severity-tagged) |
-| GET | `/api/metrics` | deploys/day, failure %, MTTR, lead time to prod |
-| GET | `/api/services/<id>/versions` | git tags + build history |
-| GET | `/api/services/<id>/all_versions` | tags + built versions merged (deploy picker) |
-| GET | `/api/services/<id>/healthy_versions` | valid rollback targets |
-| GET | `/api/builds/<id>/log` | full build log |
-| GET | `/api/preflight` | control-plane health (docker/registry/disk/ports) |
-| GET | `/api/admin/overview` | manager: all teams + control plane + failures 24h |
-| POST | `/api/admin/seed` | one-time: demo accounts + teams |
-| POST | `/api/auth/register` | add user (first user = manager; then manager-only) |
-| POST | `/api/auth/login` | session token (X-Session header) |
-| POST | `/api/auth/logout` | invalidate session |
-| GET | `/api/auth/me` | current user (username, role, team) |
-
-## Pages
-
-| Page | Who | Shows |
-|---|---|---|
-| `/` | everyone | sign in (no session = shared read-only view) |
-| `/dashboard` | engineers | own team's services, control-plane strip, rollback, events |
-| `/admin` | managers | all teams, control-plane health, failures/24h, per-team last-5 deploys+events |
+Promotion uses `POST /api/services/<id>/promote`: it selects the most recent
+historically healthy staging version and deploys it to production, where a new
+health check runs. It does not currently verify that staging is still running
+that version. Do not promise an arbitrary manual rollback target: the rollback
+API currently ignores the selected version.
 
 ## Tests
 
+With the app and kit running, from `launchpad/`:
+
 ```bash
-# preflight (control plane world: docker, registry, webhook, disk, ports, db)
-python3 preflight.py                 # expect RESULT: READY
-
-# end-to-end acceptance (register→config→build→deploy→broken→auto-rollback)
-bash tests/e2e.sh                    # expect 15 passed, 0 failed — ALL GREEN
+python3 preflight.py
+bash tests/e2e.sh
 ```
 
-Test coverage in this repo:
-- `preflight.py` — 13 environment checks (also surfaced on every page's status strip)
-- `tests/e2e.sh` — 15 assertions incl. the auto-rollback and build-log checks
-- live-proven during the build: wrong-tag build prevention (checkout -f),
-  prod-left-dark fix, prod-config refusal, concurrent-deploy rejection,
-  policy-svc prod auto-rollback, rollback-after-config-rotation safety
-  (see PROGRESS.md for the full log)
+`preflight.py` checks dependencies and local ports. `tests/e2e.sh` is a live
+integration/acceptance script, not a unit-test suite. It changes registrations,
+config, Git checkouts and running containers and uses fixed delays; run it only
+against disposable demo state. A prior recorded run reported 15 passed and 0
+failed; that is not a guarantee for a fresh environment or the latest code.
 
-## What works / what doesn't (honest list)
+## Pages and API
 
-Works: everything in the feature list above, proven live against the starter kit
-(quote-svc, policy-svc, their 3 tags each, broken versions detected and rolled back).
+| Page | Purpose |
+|---|---|
+| `/` | Demo login |
+| `/dashboard` | Team deployment and event view |
+| `/admin` | Manager overview, resource figures and team activity |
+| `/envs`, `/diff` | Comparison prototypes; known browser syntax errors |
 
-Not built (out of scope or future work):
-- Kubernetes deployment target, canary releases (deploy queue at fleet scale — a
-  simple per-service queue exists now)
-- Periodic post-deploy health re-checks — partially covered: a watchdog checks all
-  running containers every 60s and alerts `service.down` (no auto-action)
-- Password reset / session expiry beyond logout (demo-grade auth)
-- UI polish beyond functional (tokens went to the engine)
+Important endpoints include `POST /api/services`,
+`POST /api/services/<id>/config`, `/build`, `/deploy` and `/promote`,
+`POST /api/deploys/<id>/rollback`, `GET /api/deploys`, `GET /api/events`,
+`GET /api/metrics`, `GET /api/builds/<id>/log`, `GET /api/preflight` and
+`GET /api/admin/overview`. Demo login returns a token for the `X-Session` header.
+Not all write endpoints enforce authentication or team authorization.
 
-## Design notes (why it's built this way)
+## What works, what is incomplete
 
-- **Never prod-dark:** the old container is kept (stopped, not removed) until the new
-  one passes the gate; a failed run/gate restores it. Rollback = `docker start`,
-  not a rebuild.
-- **Pointer-based state:** a `pointers` table records the live version per
-  (service × environment); dashboards read it, so state stays correct after rollbacks.
-- **Snapshots over live config:** each deploy stores its env vars; rollback restores
-  the deploy-time snapshot, immune to later config rotation.
-- **Immutable versions:** builds come from pristine `checkout -f` tag states and
-  abort at the first failing step (a bad tag can never push a mistagged image);
-  the registry stores each version permanently — "what is running" is always
-  verifiable, provable via the `/diff` page (git diff + commit hash between any
-  two versions).
+- The implementation includes registry records, Docker build/push and logs,
+  deploy-time health checks, attempted automatic rollback, staging/prod config,
+  history, webhook events and delivery metrics. Verify behavior in your own
+  fresh environment before relying on it.
+- Targeted manual rollback is fully implemented: engineers and managers can select
+  any previous healthy deployment from history via the UI (in `/dashboard` and `/admin`)
+  or via `POST /api/deploys/<id>/rollback` and `POST /api/services/<id>/rollback` with
+  `{"version": "..."}`.
+- Browser syntax and DOM references in `/envs` and `/diff` have been cleaned up and verified.
+- One-command startup is provided via `start.sh`.
+- The watchdog checks whether pointer-referenced containers are running, not
+  whether their `/health` endpoint remains healthy; it only notifies. Webhook
+  delivery is best effort. The in-process deployment wait is not a durable queue.
+- CPU shown by the resource endpoint is an average since host boot, not a live
+  CPU sample. Lead time is a staging-start to production-start proxy; it is not
+  commit-to-production lead time and can include failed deployment attempts.
+- Credentials are trivial, sensitive config is stored in SQLite, shell commands
+  accept untrusted inputs and endpoint authorization is incomplete. Do not
+  expose the app to untrusted users. Kubernetes, canaries and zero downtime are
+  not implemented.
 
-## Extras beyond the must-haves
-
-- **Manager console** (`/admin`): all teams, control-plane health (13-check
-  preflight), **live resource monitor** (CPU/RAM/disk bars — see when the control
-  plane itself needs more capacity), failures/24h graph, delivery metrics graphs,
-  per-team cards (last 5 deploys + events), one-click **Deploy to staging** /
-  **Push to production** buttons.
-- **Watchdog**: every running container checked every 60s; a death fires a
-  one-time `service.down` alert webhook (no spam).
-- **Deploy queue**: concurrent deploys for the same (service × env) wait their
-  turn (queued/dequeued events) instead of being rejected.
-- **`/envs` page**: staging vs production of the same service side by side —
-  env mode, version, commit hash, ports — with the live git diff between what
-  each environment runs.
-- **`/diff` page**: physical proof of what changed between any two versions
-  (commits, files, full colorized git diff).
-- **Structured webhooks**: severity tiers (info/warning/alert) + service/version/
-  environment context on every event.
-
-## Layout
-
-```
-launchpad/
-├── app.py          # control plane (API + UI + engine), Flask + SQLite
-├── preflight.py    # environment checks (also surfaced on the dashboard)
-├── restart.sh      # restart the server after edits
-├── install-and-run.sh / requirements.txt
-└── tests/e2e.sh    # acceptance test (15 assertions)
-```
-
-Data: `launchpad.db` (SQLite, auto-migrated). Kit services are never modified —
-Launchpad only checks out their tags.
+See `PLAN.md`, `DESIGN.md`, `PROGRESS.md`, `DECISIONS.md` and `REVIEW.md` for
+the plan, decisions, build record and self-review. Historical docs may include
+claims superseded by this README and `PROGRESS.md`.
