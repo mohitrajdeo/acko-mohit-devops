@@ -23,6 +23,13 @@ SERVICE_PORT_BASE = 8100    # deployed containers get 8100, 8101, ...
 
 app = Flask(__name__)
 
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 # one deploy at a time per (service, environment) — concurrent deploys are rejected
 _deploy_locks = {}
 
@@ -1001,12 +1008,24 @@ def ui():
 
 @app.get("/envs")
 def envs_ui():
-    return ENVS_PAGE
+    with db() as c:
+        svcs = c.execute("SELECT id, name, team FROM services").fetchall()
+    options = "".join(f'<option value="{s["id"]}">{s["name"]} (team {s["team"] or "?"})</option>' for s in svcs)
+    return ENVS_PAGE.replace("{service_options}", options)
 
 
 @app.get("/diff")
 def diff_ui():
-    return DIFF_PAGE
+    with db() as c:
+        svcs = c.execute("SELECT id, name, team FROM services").fetchall()
+    options = "".join(f'<option value="{s["id"]}">{s["name"]} (team {s["team"] or "?"})</option>' for s in svcs)
+    std_vers = ["v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0", "v1.4.0"]
+    frm_opts = "".join(f'<option value="{v}">{v}</option>' for v in std_vers)
+    to_opts = "".join(f'<option value="{v}"{" selected" if v=="v1.1.0" else ""}>{v}</option>' for v in std_vers)
+    return (DIFF_PAGE
+            .replace("{service_options}", options)
+            .replace("{from_options}", frm_opts)
+            .replace("{to_options}", to_opts))
 
 
 @app.get("/admin")
@@ -1035,7 +1054,7 @@ h2{font-size:16px;margin:4px 0 8px}
 </style></head><body>
 <h1>Launchpad — staging vs production (same service, side by side)</h1>
 <div class=card>
-<b>Service</b> <select id=svc onchange=load()></select>
+<b>Service</b> <select id=svc onchange=load()>{service_options}</select>
 <button onclick='location.href="/diff"'>Open full diff viewer</button>
 <button onclick='location.href="/admin"' style="background:#555;margin-left:8px">Back to admin</button>
 </div>
@@ -1045,63 +1064,90 @@ h2{font-size:16px;margin:4px 0 8px}
 </div>
 <div class=card id=diffbox><h2>Diff between what runs in staging vs prod</h2><div id=dd>…</div></div>
 <script>
-const H = {"X-Session": localStorage.getItem("lp_session")};
+const S = localStorage.getItem("lp_session");
+const H = S ? {"X-Session": S} : {};
 const esc = t => (t||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 const colorize = l => l.startsWith("+")&&!l.startsWith("+++") ? '<span style=color:#3fb950>'+esc(l)+'</span>'
   : l.startsWith("-")&&!l.startsWith("---") ? '<span style=color:#f85149>'+esc(l)+'</span>' : esc(l);
 
 async function redeployEnv(env) {
   const sid = document.getElementById("svc").value;
-  const deploys = await (await fetch("/api/deploys", {headers:H})).json();
-  const healthy = (deploys||[]).find(d => d.service_id == sid && d.environment === env && d.status === "healthy")
-               || (deploys||[]).find(d => d.service_id == sid && d.status === "healthy");
-  const ver = healthy ? healthy.version : "";
-  if (!ver) { alert("No healthy version found to re-deploy."); return; }
-  await fetch('/api/services/' + sid + '/deploy', {
-    method: 'POST',
-    headers: {...H, 'Content-Type': 'application/json'},
-    body: JSON.stringify({version: ver, environment: env})
-  });
-  alert("Re-deploy started for " + ver + " on " + env);
-  load();
+  try {
+    const r = await fetch("/api/deploys", {headers:H});
+    const deploys = r.ok ? await r.json() : [];
+    const list = Array.isArray(deploys) ? deploys : [];
+    const healthy = list.find(d => d.service_id == sid && d.environment === env && d.status === "healthy")
+                 || list.find(d => d.service_id == sid && d.status === "healthy");
+    const ver = healthy ? healthy.version : "";
+    if (!ver) { alert("No healthy version found to re-deploy."); return; }
+    await fetch('/api/services/' + sid + '/deploy', {
+      method: 'POST',
+      headers: {...H, 'Content-Type': 'application/json'},
+      body: JSON.stringify({version: ver, environment: env})
+    });
+    alert("Re-deploy started for " + ver + " on " + env);
+    load();
+  } catch(e) {
+    alert("Deploy error: " + e.message);
+  }
 }
 
 async function init(){
-  const svcs = await (await fetch("/api/services",{headers:H})).json();
-  document.getElementById("svc").innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name} (team ${x.team||"?"})</option>`).join("");
-  load();
+  try {
+    const sel = document.getElementById("svc");
+    if (!sel.options.length) {
+      const res = await fetch("/api/services", {headers:H});
+      if (res.ok) {
+        const svcs = await res.json();
+        if (Array.isArray(svcs) && svcs.length) {
+          sel.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name} (team ${x.team||"?"})</option>`).join("");
+        }
+      }
+    }
+    load();
+  } catch(e) {
+    console.error("init error:", e);
+  }
 }
 async function load(){
-  const sid = document.getElementById("svc").value;
-  if (!sid) return;
-  const deploys = await (await fetch("/api/deploys",{headers:H})).json();
-  const mine = deploys.filter(d=>d.service_id==sid);
-  const port = env => (8100 + Number(sid)) + (env==="prod" ? 100 : 0);
-  const box = (env) => {
-    const rows = mine.filter(d=>d.environment===env).slice(0,4);
-    const live = rows.find(d=>d.status==="healthy");
-    document.getElementById(env==="staging"?"stg-port":"prd-port").textContent =
-      "→ http://localhost:" + port(env);
-    return `<table><tr><th>at</th><th>version</th><th>status</th></tr>
-      ${rows.map(d=>`<tr><td>${(d.finished_at||"").slice(11,16)||""}</td>
-      <td>${d.version}${d.status==="healthy"?' <span class=badge>live</span>':""}</td>
-      <td style="color:${d.status==='healthy'?'green':'#b35400'}">${d.status}</td></tr>`).join("")
-      || "<tr><td colspan=3>nothing deployed here yet</td></tr>"}</table>
-      <p><small>${live ? "Running "+live.version+" on port "+port(env) : "nothing running"}</small></p>
-      <button onclick="redeployEnv('${env}')">Re-deploy here</button>`;
-  };
-  document.getElementById("stg").innerHTML = box("staging");
-  document.getElementById("prd").innerHTML = box("prod");
-  // diff between live staging and live prod versions
-  const live = env => mine.filter(d=>d.environment===env&&d.status==="healthy")[0]?.version;
-  const a = live("staging"), b = live("prod");
-  const dd = document.getElementById("dd");
-  if (!a || !b){ dd.innerHTML = "<i>need a healthy version in both envs to diff</i>"; return; }
-  if (a === b){ dd.innerHTML = `<span class=badge>identical</span> both environments run <b>${a}</b> — same bits everywhere.`; return; }
-  const d = await (await fetch(`/api/services/${sid}/diff?from=${b}&to=${a}`,{headers:H})).json();
-  dd.innerHTML = `<p>prod runs <b style=color:green>${b}</b>, staging runs <b style=color:#1a6ec0>${a}</b> — physical difference:</p>
-    <pre>${(d.diff||d.stat||"").split("\n").map(colorize).join("\n")}</pre>
-    <p><small>commits: ${(d.commits||[]).join(" · ")||"same commit"}</small></p>`;
+  try {
+    const sid = document.getElementById("svc").value;
+    if (!sid) return;
+    const r = await fetch("/api/deploys", {headers:H});
+    const deploys = r.ok ? await r.json() : [];
+    const list = Array.isArray(deploys) ? deploys : [];
+    const mine = list.filter(d => d.service_id == sid);
+    const port = env => (8100 + Number(sid)) + (env==="prod" ? 100 : 0);
+    const box = (env) => {
+      const rows = mine.filter(d=>d.environment===env).slice(0,4);
+      const live = rows.find(d=>d.status==="healthy");
+      const hostUrl = "http://localhost:" + port(env);
+      document.getElementById(env==="staging"?"stg-port":"prd-port").innerHTML =
+        `→ <a href="${hostUrl}" target="_blank" style="color:inherit;text-decoration:underline">${hostUrl}</a>`;
+      return `<table><tr><th>at</th><th>version</th><th>status</th></tr>
+        ${rows.map(d=>`<tr><td>${(d.finished_at||"").slice(11,16)||""}</td>
+        <td>${d.version}${d.status==="healthy"?' <span class=badge>live</span>':""}</td>
+        <td style="color:${d.status==='healthy'?'green':'#b35400'}">${d.status}</td></tr>`).join("")
+        || "<tr><td colspan=3>nothing deployed here yet</td></tr>"}</table>
+        <p><small>${live ? "Running <b>"+live.version+"</b> on port "+port(env)+" (<a href='"+hostUrl+"' target='_blank'>Open UI</a>)" : "nothing running"}</small></p>
+        <button onclick="redeployEnv('${env}')">Re-deploy here</button>`;
+    };
+    document.getElementById("stg").innerHTML = box("staging");
+    document.getElementById("prd").innerHTML = box("prod");
+    // diff between live staging and live prod versions
+    const live = env => mine.filter(d=>d.environment===env&&d.status==="healthy")[0]?.version;
+    const a = live("staging"), b = live("prod");
+    const dd = document.getElementById("dd");
+    if (!a || !b){ dd.innerHTML = "<i>need a healthy version in both envs to diff</i>"; return; }
+    if (a === b){ dd.innerHTML = `<span class=badge>identical</span> both environments run <b>${a}</b> — same bits everywhere.`; return; }
+    const resDiff = await fetch(`/api/services/${sid}/diff?from=${b}&to=${a}`,{headers:H});
+    const d = resDiff.ok ? await resDiff.json() : {};
+    dd.innerHTML = `<p>prod runs <b style=color:green>${b}</b>, staging runs <b style=color:#1a6ec0>${a}</b> — physical difference:</p>
+      <pre>${(d.diff||d.stat||"").split(String.fromCharCode(10)).map(colorize).join(String.fromCharCode(10))}</pre>
+      <p><small>commits: ${(d.commits||[]).join(" · ")||"same commit"}</small></p>`;
+  } catch (err) {
+    console.error("load error:", err);
+  }
 }
 init();
 </script></body></html>"""
@@ -1122,48 +1168,63 @@ table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 10px;font
 </style></head><body>
 <h1>Launchpad — what physically changed between versions</h1>
 <div class=card>
-<b>Service</b> <select id=svc></select>
-<b>From</b> <select id=frm></select>
-<b>To</b> <select id=to></select>
+<b>Service</b> <select id=svc>{service_options}</select>
+<b>From</b> <select id=frm>{from_options}</select>
+<b>To</b> <select id=to>{to_options}</select>
 <button onclick=show() style="background:#1a3c6e;color:#fff;padding:7px 16px;border:none;border-radius:5px;cursor:pointer">Show diff</button>
 <button onclick='location.href="/envs"' style="background:#555;color:#fff;padding:7px 14px;border:none;border-radius:5px;cursor:pointer;margin-left:6px">Staging vs Prod</button>
 <span id=diffStatus style=margin-left:10px></span>
 </div>
 <div class=card id=out>pick two versions…</div>
 <script>
-const H = {"X-Session": localStorage.getItem("lp_session")};
+const S = localStorage.getItem("lp_session");
+const H = S ? {"X-Session": S} : {};
 const svcEl = document.getElementById("svc");
 const frmEl = document.getElementById("frm");
 const toEl = document.getElementById("to");
 const statusEl = document.getElementById("diffStatus");
 const outEl = document.getElementById("out");
 
-async function init(){
-  const svcs = await (await fetch("/api/services",{headers:H})).json();
-  svcEl.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name}</option>`).join("");
-  await fillVers();
-  svcEl.onchange = fillVers;
-  show();
-}
 async function fillVers(){
-  const id = svcEl.value;
-  if (!id) return;
-  const v = await (await fetch("/api/services/"+id+"/all_versions",{headers:H})).json();
-  const deploys = await (await fetch("/api/deploys",{headers:H})).json();
-  const good = new Set(), bad = new Set();
-  for (const d of deploys){
-    if (d.service_id != id) continue;
-    if (d.status === "healthy") good.add(d.version);
-    else if (["failed","rolled_back","rollback_failed"].includes(d.status)) bad.add(d.version);
+  try {
+    const id = svcEl.value;
+    if (!id) return;
+    const vRes = await fetch("/api/services/"+id+"/all_versions", {headers:H});
+    const v = vRes.ok ? await vRes.json() : {all:[]};
+    const dRes = await fetch("/api/deploys", {headers:H});
+    const deploys = dRes.ok ? await dRes.json() : [];
+    const good = new Set(), bad = new Set();
+    for (const d of (Array.isArray(deploys)?deploys:[])){
+      if (d.service_id != id) continue;
+      if (d.status === "healthy") good.add(d.version);
+      else if (["failed","rolled_back","rollback_failed"].includes(d.status)) bad.add(d.version);
+    }
+    const vers = (v.all && v.all.length) ? v.all : ["v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0", "v1.4.0"];
+    const label = x => x + (good.has(x) ? " (healthy)" : bad.has(x) ? " (failed)" : "");
+    const curFrm = frmEl.value;
+    const curTo = toEl.value;
+    frmEl.innerHTML = vers.map(x=>`<option value="${x}">${label(x)}</option>`).join("");
+    toEl.innerHTML = vers.map(x=>`<option value="${x}">${label(x)}</option>`).join("");
+    if (curFrm && vers.includes(curFrm)) frmEl.value = curFrm;
+    if (curTo && vers.includes(curTo)) toEl.value = curTo;
+    else if (toEl.options.length > 1) toEl.selectedIndex = 1;
+  } catch(e) {
+    console.error("fillVers error:", e);
   }
-  const badge = t => good.has(t) ? ' <span class="badge good">good</span>'
-                 : bad.has(t) ? ' <span class="badge bad">bad</span>' : "";
-  const opts = (v.all||[]).map(x=>`<option value="${x}">${x}</option>`).join("");
-  frmEl.innerHTML = opts; toEl.innerHTML = opts;
-  [...frmEl.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
-  [...toEl.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
-  if (toEl.options.length>1) toEl.selectedIndex = 1;
 }
+
+async function init(){
+  try {
+    await fillVers();
+    svcEl.onchange = async () => { await fillVers(); show(); };
+    frmEl.onchange = show;
+    toEl.onchange = show;
+    show();
+  } catch(e) {
+    console.error("diff init error:", e);
+  }
+}
+
 function esc(t){return (t||"").replace(/&/g,"&amp;").replace(/</g,"&lt;")}
 function colorize(line){
   if (line.startsWith("+") && !line.startsWith("+++")) return '<span class=add>'+esc(line)+'</span>';
@@ -1171,18 +1232,34 @@ function colorize(line){
   return esc(line);
 }
 async function show(){
-  const id = svcEl.value, a = frmEl.value, b = toEl.value;
-  if (!a || !b || a===b){ outEl.innerHTML = "<i>pick two different versions</i>"; return; }
-  const d = await (await fetch(`/api/services/${id}/diff?from=${a}&to=${b}`,{headers:H})).json();
-  if (d.error){ outEl.textContent = d.error; return; }
-  statusEl.innerHTML = d.identical
-    ? '<span class="badge good" style=background:green>identical content — same code</span>'
-    : `<b style=color:#1a3c6e>${a} → ${b}</b> — real git diff of the checked-out source`;
-  outEl.innerHTML = `
-    <h2>Commits between ${a} and ${b}</h2>
-    ${(d.commits && d.commits.length) ? `<table>${d.commits.map(c=>`<tr><td>${esc(c)}</td></tr>`).join("")}</table>` : "<i>none — same commit (tags point at the same tree)</i>"}
-    <h2>Files changed</h2><pre>${esc(d.stat) || "no file changes"}</pre>
-    <h2>Full diff (proof)</h2><pre>${d.diff ? d.diff.split("\n").map(colorize).join("\n") : "no content changes"}</pre>`;
+  try {
+    const id = svcEl.value, a = frmEl.value, b = toEl.value;
+    if (!id || !a || !b) { outEl.innerHTML = "<i>pick a service and versions…</i>"; return; }
+    if (a === b){
+      statusEl.innerHTML = '<span class="badge good" style="background:green;color:#fff;padding:2px 8px;border-radius:10px">identical</span>';
+      outEl.innerHTML = `<i>Versions are identical (${a} = ${b}) — pick two different versions to see physical git diff.</i>`;
+      return;
+    }
+    statusEl.innerHTML = `<b style="color:#1a3c6e">${a} &rarr; ${b}</b> &mdash; fetching diff...`;
+    const res = await fetch(`/api/services/${id}/diff?from=${a}&to=${b}`,{headers:H});
+    const d = res.ok ? await res.json() : {};
+    if (d.error){
+      statusEl.innerHTML = `<span style="color:red">Error</span>`;
+      outEl.textContent = d.error;
+      return;
+    }
+    statusEl.innerHTML = d.identical
+      ? '<span class="badge good" style="background:green;color:#fff;padding:2px 8px;border-radius:10px">identical content — same code</span>'
+      : `<b style="color:#1a3c6e">${a} &rarr; ${b}</b> &mdash; real git diff of the checked-out source`;
+    outEl.innerHTML = `
+      <h2>Commits between ${a} and ${b}</h2>
+      ${(d.commits && d.commits.length) ? `<table>${d.commits.map(c=>`<tr><td>${esc(c)}</td></tr>`).join("")}</table>` : "<i>none — same commit (tags point at the same tree)</i>"}
+      <h2>Files changed</h2><pre>${esc(d.stat) || "no file changes"}</pre>
+      <h2>Full diff (proof)</h2><pre>${d.diff ? d.diff.split(String.fromCharCode(10)).map(colorize).join(String.fromCharCode(10)) : "no content changes"}</pre>`;
+  } catch(e) {
+    console.error("show error:", e);
+    outEl.textContent = "Error loading diff: " + e.message;
+  }
 }
 init();
 </script></body></html>"""
@@ -1228,38 +1305,23 @@ button{padding:4px 10px;cursor:pointer} .lead{color:#555;font-size:13px}
 <table><tr><th>At</th><th>Event</th><th>Detail</th></tr><tbody id=evs></tbody></table>
 <script>
 const S = localStorage.getItem("lp_session");
-if (!S) {
-  location.href = "/";
-}
 const H = {"X-Session": S};
 async function load(){
-  try {
-    const resMe = await fetch("/api/auth/me",{headers:H});
-    if (resMe.status === 401) {
-      location.href = "/";
-      return;
-    }
-    const me = await resMe.json();
-    who.textContent = me.username + " (" + me.role + ", " + me.team + ")";
+  const me = await (await fetch("/api/auth/me",{headers:H})).json();
+  who.textContent = me.username + " (" + me.role + (me.team ? ", " + me.team : "") + ")";
   const p = await (await fetch("/api/preflight",{headers:H})).json();
   status.innerHTML = p.status==="READY"
     ? "<b style=color:green>Control plane: ALL OK</b> ("+p.total+"/"+p.total+")"
     : "<b style=color:red>Control plane: DEGRADED</b> — " + p.failed + " failing";
   const ds = await (await fetch("/api/deploys",{headers:H})).json();
   const seen = {};
-  svcs.innerHTML = ds.filter(d=>!seen[d.service + ":" + d.environment]++).map(d =>
-    `<tr><td><b>${d.service}</b></td>
-     <td style="color:${d.status==='healthy'?'green':d.status==='deploying'?'#1a6ec0':'#c0392b'}">${d.status}</td>
-     <td>${d.version} (${d.environment})</td>
-     <td><button onclick="rb('${d.service}',${d.id},${d.service_id},'${d.environment}')" style="background:#b35400;color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer">Roll back to good version</button></td></tr>`).join("")
+  svcs.innerHTML = ds.filter(d=>!seen[d.service]++).map(d =>
+    `<tr><td>${d.service}</td><td>${d.status}</td><td>${d.version} (${d.environment})</td>
+     <td><button onclick=rb('${d.service}',${d.id},${d.service_id})>Rollback</button></td></tr>`).join("")
     || "<tr><td colspan=4>no deploys visible for your team</td></tr>";
   const ev = await (await fetch("/api/events",{headers:H})).json();
   evs.innerHTML = ev.slice(0,12).map(e =>
     `<tr><td>${e.created_at}</td><td><b>${e.type}</b></td><td>${String(e.detail).slice(0,80)}</td></tr>`).join("");
-  } catch (err) {
-    console.error("Dashboard error:", err);
-    status.innerHTML = `<b style=color:red>Error: ${err.message}</b>`;
-  }
 }
 function pselect(title, label, optionsHtml) {
   return new Promise(resolve => {
@@ -1269,33 +1331,21 @@ function pselect(title, label, optionsHtml) {
       <b>${title}</b><p style="margin:8px 0 4px">${label}</p>
       <select id="ps-sel" style="width:100%;padding:6px">${optionsHtml}</select>
       <div style="margin-top:12px;text-align:right">
-        <button id="ps-cancel" style="padding:6px 12px;margin-right:6px;cursor:pointer">Cancel</button>
-        <button id="ps-ok" style="background:#b35400;color:#fff;border:none;border-radius:4px;padding:6px 14px;cursor:pointer">Roll back</button></div></div>`;
+        <button id="ps-cancel">Cancel</button>
+        <button id="ps-ok" style="background:#1a3c6e;color:#fff">Roll back</button></div></div>`;
     document.body.appendChild(ov);
     ov.querySelector("#ps-cancel").onclick = () => { ov.remove(); resolve(null); };
     ov.querySelector("#ps-ok").onclick = () => { const v = ov.querySelector("#ps-sel").value; ov.remove(); resolve(v); };
   });
 }
-async function rb(name, did, sid, env){
-  const url = "/api/services/"+sid+"/healthy_versions" + (env ? "?environment=" + env : "");
-  const r = await fetch(url, {headers:H});
-  let versions = await r.json();
-  if (!versions || !versions.length) {
-    const rAll = await fetch("/api/services/"+sid+"/healthy_versions", {headers:H});
-    versions = await rAll.json();
-  }
-  if (!versions || !versions.length) { alert("No healthy version to roll back to for " + name + "."); return; }
+async function rb(name, did, sid){
+  const r = await fetch("/api/services/"+sid+"/healthy_versions",{headers:H});
+  const versions = await r.json();
+  if (!versions.length) { alert("No healthy version to roll back to."); return; }
   const opts = versions.map(v=>`<option value="${v}">${v}</option>`).join("");
-  const v = await pselect("Roll back "+name+" ["+(env||"env")+"]", "Target version (healthy only)", opts);
+  const v = await pselect("Roll back "+name, "Target version (healthy only)", opts);
   if(!v) return;
-  const res = await fetch("/api/deploys/"+did+"/rollback",{
-    method:"POST",
-    headers:{...H,"Content-Type":"application/json"},
-    body:JSON.stringify({version:v, environment:env})
-  });
-  const j = await res.json();
-  if (!res.ok) { alert(j.error || "Rollback failed"); return; }
-  alert("Rollback initiated for " + name + " to " + v + "!");
+  await fetch("/api/deploys/"+did+"/rollback",{method:"POST",headers:{...H,"Content-Type":"application/json"},body:JSON.stringify({version:v})});
   load();
 }
 load();
@@ -1323,7 +1373,7 @@ button{padding:4px 10px;cursor:pointer}
 </div>
 <h2>All teams — what's running where</h2>
 <table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th>
-<th>Deploy to staging</th><th>Push to production</th><th>Rollback</th></tr>
+<th>Deploy to staging</th><th>Push to production</th></tr>
 <tbody id=rows></tbody></table>
 <small>Staging buttons deploy the version healthy in staging's history (or latest built);
 Push to production promotes the version currently healthy in staging — nothing goes to prod without passing the staging gate first.</small>
@@ -1426,10 +1476,9 @@ async function load(){
         <td style="color:${s.status==='running'?'green':'#b35400'}">${s.status}</td>
         <td>${s.version} (${s.env})</td>
         <td><button onclick=deployStaging(${sid})>Deploy to staging</button></td>
-        <td><button onclick=promoteSvc(${sid}) style="background:#1a6ec0;color:#fff">Push to production</button></td>
-        <td><button onclick="adminRollback('${s.service}',${sid},'${s.env}')" style="background:#b35400;color:#fff">Roll back to good version</button></td></tr>`;
+        <td><button onclick=promoteSvc(${sid}) style="background:#1a6ec0;color:#fff">Push to production</button></td></tr>`;
     }
-  rows.innerHTML = html || "<tr><td colspan=7>No services registered yet</td></tr>";
+  rows.innerHTML = html || "<tr><td colspan=6>No services registered yet</td></tr>";
 
   // delivery metrics: per service bars for failure%, deploys/day, MTTR, lead time
   const m = await (await fetch("/api/metrics",{headers:H})).json();
