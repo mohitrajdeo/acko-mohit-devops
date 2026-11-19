@@ -87,6 +87,15 @@ def init_db():
             c.execute("ALTER TABLE deploys ADD COLUMN env_snapshot TEXT DEFAULT ''")
         if "failure_stage" not in dcols:
             c.execute("ALTER TABLE deploys ADD COLUMN failure_stage TEXT DEFAULT ''")
+        # Ensure default demo users exist out of the box
+        if not c.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
+            c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
+                      ("admin", hash_pw("1234"), "", "manager"))
+        for name, team, role in (("team1", "team1", "engineer"),
+                                 ("team2", "team2", "engineer")):
+            if not c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                c.execute("INSERT INTO users(username,password_hash,team,role) VALUES(?,?,?,?)",
+                          (name, hash_pw("1234"), team, role))
 
 
 def now():
@@ -234,6 +243,8 @@ def deploy(service_id, version, environment):
         env_vars = {r["key"]: r["value"] for r in c.execute(
             "SELECT key,value FROM configs WHERE service_id=? AND environment=?",
             (service_id, environment))}
+        if "APP_ENV" not in env_vars:
+            env_vars["APP_ENV"] = environment
         cur = c.execute(
             "INSERT INTO deploys(service_id,version,environment,status,started_at,env_snapshot) "
             "VALUES(?,?,?,?,?,?)",
@@ -264,6 +275,8 @@ def deploy(service_id, version, environment):
     # unique port per (service, environment) so staging and prod can run side by side
     env_offset = 100 if environment == "prod" else 0
     host_port = SERVICE_PORT_BASE + service_id + env_offset
+    env_vars["HOST_PORT"] = str(host_port)
+    env_vars["APP_ENV"] = environment
     env_flags = " ".join(f"-e {k}={v}" for k, v in env_vars.items())
     image = f"localhost:5000/{svc['name']}:{version}"
     # stop (not remove) old container so we can recover if the new one fails
@@ -346,13 +359,19 @@ def _finish_deploy(deploy_id, status, detail, effective_version=None):
     log_event(deploy_id, f"deploy.{status}", detail)
 
 
-def last_good_version(service_id, environment, exclude_deploy):
+def last_good_version(service_id, environment, exclude_deploy=None):
     """Returns (version, env_snapshot) of the most recent healthy deploy."""
     with db() as c:
-        row = c.execute(
-            "SELECT version, env_snapshot FROM deploys WHERE service_id=? AND environment=? "
-            "AND status='healthy' AND id<? ORDER BY id DESC LIMIT 1",
-            (service_id, environment, exclude_deploy)).fetchone()
+        if exclude_deploy is not None:
+            row = c.execute(
+                "SELECT version, env_snapshot FROM deploys WHERE service_id=? AND environment=? "
+                "AND status='healthy' AND id<? ORDER BY id DESC LIMIT 1",
+                (service_id, environment, exclude_deploy)).fetchone()
+        else:
+            row = c.execute(
+                "SELECT version, env_snapshot FROM deploys WHERE service_id=? AND environment=? "
+                "AND status='healthy' ORDER BY id DESC LIMIT 1",
+                (service_id, environment)).fetchone()
     if not row:
         return None, None
     snap = json.loads(row["env_snapshot"]) if row["env_snapshot"] else None
@@ -442,27 +461,67 @@ def api_promote(sid):
     """Promote the version currently healthy in staging to prod (one action)."""
     b = request.json or {}
     with db() as c:
-        row = c.execute(
-            "SELECT version FROM deploys WHERE service_id=? AND environment='staging' "
-            "AND status='healthy' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
-        if not row:
-            return jsonify(error="no healthy staging version to promote"), 400
-    version = row["version"]
+        ptr = c.execute(
+            "SELECT version FROM pointers WHERE service_id=? AND environment='staging'",
+            (sid,)).fetchone()
+        if ptr and ptr["version"]:
+            version = ptr["version"]
+        else:
+            row = c.execute(
+                "SELECT version FROM deploys WHERE service_id=? AND environment='staging' "
+                "AND status='healthy' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+            if not row:
+                return jsonify(error="no healthy staging version to promote"), 400
+            version = row["version"]
     did = deploy(sid, version, b.get("environment", "prod"))
     return jsonify(deploy_id=did, promoted=version)
 
 
 @app.post("/api/deploys/<int:did>/rollback")
 def api_rollback(did):
+    b = request.json or {}
+    req_v = b.get("version")
     with db() as c:
         d = c.execute("SELECT * FROM deploys WHERE id=?", (did,)).fetchone()
+        if not d:
+            return jsonify(error="deploy not found"), 404
         svc = c.execute("SELECT * FROM services WHERE id=?", (d["service_id"],)).fetchone()
-    good, _snap = last_good_version(svc["id"], d["environment"], did)
-    if not good:
+        if not svc:
+            return jsonify(error="service not found"), 404
+
+    target_v = req_v
+    if not target_v:
+        target_v, _snap = last_good_version(svc["id"], d["environment"], did)
+
+    if not target_v:
         return jsonify(error="no earlier good version"), 400
-    log_event(did, "rollback.manual", f"to {good}")
-    deploy(svc["id"], good, d["environment"])
-    return jsonify(ok=True, version=good)
+
+    log_event(did, "rollback.manual", f"to {target_v}")
+    new_did = deploy(svc["id"], target_v, d["environment"])
+    return jsonify(ok=True, version=target_v, deploy_id=new_did)
+
+
+@app.post("/api/services/<int:sid>/rollback")
+def api_service_rollback(sid):
+    """Roll back a service to any earlier good version in one action."""
+    b = request.json or {}
+    req_v = b.get("version")
+    env = b.get("environment", "prod")
+    with db() as c:
+        svc = c.execute("SELECT * FROM services WHERE id=?", (sid,)).fetchone()
+        if not svc:
+            return jsonify(error="service not found"), 404
+
+    target_v = req_v
+    if not target_v:
+        target_v, _snap = last_good_version(sid, env)
+
+    if not target_v:
+        return jsonify(error="no earlier good version"), 400
+
+    new_did = deploy(sid, target_v, env)
+    log_event(new_did, "rollback.manual", f"service {svc['name']} in {env} to {target_v}")
+    return jsonify(ok=True, version=target_v, deploy_id=new_did)
 
 
 @app.post("/api/auth/register")
@@ -687,10 +746,16 @@ def api_all_versions(sid):
 @app.get("/api/services/<int:sid>/healthy_versions")
 def api_healthy_versions(sid):
     """Distinct versions that ever passed the health gate — valid rollback targets."""
+    env = request.args.get("environment")
     with db() as c:
-        rows = c.execute(
-            "SELECT DISTINCT version FROM deploys WHERE service_id=? AND status='healthy' "
-            "ORDER BY version DESC", (sid,)).fetchall()
+        if env:
+            rows = c.execute(
+                "SELECT DISTINCT version FROM deploys WHERE service_id=? AND environment=? AND status='healthy' "
+                "ORDER BY id DESC", (sid, env)).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT DISTINCT version FROM deploys WHERE service_id=? AND status='healthy' "
+                "ORDER BY id DESC", (sid,)).fetchall()
     return jsonify([r["version"] for r in rows])
 
 
@@ -971,7 +1036,8 @@ h2{font-size:16px;margin:4px 0 8px}
 <h1>Launchpad — staging vs production (same service, side by side)</h1>
 <div class=card>
 <b>Service</b> <select id=svc onchange=load()></select>
-<button onclick=location.href="/diff">Open full diff viewer</button>
+<button onclick='location.href="/diff"'>Open full diff viewer</button>
+<button onclick='location.href="/admin"' style="background:#555;margin-left:8px">Back to admin</button>
 </div>
 <div class=cols>
 <div class="col stg"><h2 style=color:#1a6ec0>STAGING <span id=stg-port></span></h2><div id=stg>…</div></div>
@@ -980,17 +1046,34 @@ h2{font-size:16px;margin:4px 0 8px}
 <div class=card id=diffbox><h2>Diff between what runs in staging vs prod</h2><div id=dd>…</div></div>
 <script>
 const H = {"X-Session": localStorage.getItem("lp_session")};
-const esc = t => t.replace(/&/g,"&amp;").replace(/</g,"&lt;");
+const esc = t => (t||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 const colorize = l => l.startsWith("+")&&!l.startsWith("+++") ? '<span style=color:#3fb950>'+esc(l)+'</span>'
   : l.startsWith("-")&&!l.startsWith("---") ? '<span style=color:#f85149>'+esc(l)+'</span>' : esc(l);
 
+async function redeployEnv(env) {
+  const sid = document.getElementById("svc").value;
+  const deploys = await (await fetch("/api/deploys", {headers:H})).json();
+  const healthy = (deploys||[]).find(d => d.service_id == sid && d.environment === env && d.status === "healthy")
+               || (deploys||[]).find(d => d.service_id == sid && d.status === "healthy");
+  const ver = healthy ? healthy.version : "";
+  if (!ver) { alert("No healthy version found to re-deploy."); return; }
+  await fetch('/api/services/' + sid + '/deploy', {
+    method: 'POST',
+    headers: {...H, 'Content-Type': 'application/json'},
+    body: JSON.stringify({version: ver, environment: env})
+  });
+  alert("Re-deploy started for " + ver + " on " + env);
+  load();
+}
+
 async function init(){
   const svcs = await (await fetch("/api/services",{headers:H})).json();
-  svc.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name} (team ${x.team||"?"})</option>`).join("");
+  document.getElementById("svc").innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name} (team ${x.team||"?"})</option>`).join("");
   load();
 }
 async function load(){
-  const sid = svc.value;
+  const sid = document.getElementById("svc").value;
+  if (!sid) return;
   const deploys = await (await fetch("/api/deploys",{headers:H})).json();
   const mine = deploys.filter(d=>d.service_id==sid);
   const port = env => (8100 + Number(sid)) + (env==="prod" ? 100 : 0);
@@ -1005,10 +1088,10 @@ async function load(){
       <td style="color:${d.status==='healthy'?'green':'#b35400'}">${d.status}</td></tr>`).join("")
       || "<tr><td colspan=3>nothing deployed here yet</td></tr>"}</table>
       <p><small>${live ? "Running "+live.version+" on port "+port(env) : "nothing running"}</small></p>
-      <button onclick="fetch('/api/services/'+svc.value+'/deploy',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify({version:(deploys||[]).find(d=>d.service_id==svc.value&&d.status==='healthy')?.version||'',environment:'${env}'})}).then(()=>load())">Re-deploy here</button>`;
+      <button onclick="redeployEnv('${env}')">Re-deploy here</button>`;
   };
-  stg.innerHTML = box("staging");
-  prd.innerHTML = box("prod");
+  document.getElementById("stg").innerHTML = box("staging");
+  document.getElementById("prd").innerHTML = box("prod");
   // diff between live staging and live prod versions
   const live = env => mine.filter(d=>d.environment===env&&d.status==="healthy")[0]?.version;
   const a = live("staging"), b = live("prod");
@@ -1043,20 +1126,28 @@ table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 10px;font
 <b>From</b> <select id=frm></select>
 <b>To</b> <select id=to></select>
 <button onclick=show() style="background:#1a3c6e;color:#fff;padding:7px 16px;border:none;border-radius:5px;cursor:pointer">Show diff</button>
-<span id=status style=margin-left:10px></span>
+<button onclick='location.href="/envs"' style="background:#555;color:#fff;padding:7px 14px;border:none;border-radius:5px;cursor:pointer;margin-left:6px">Staging vs Prod</button>
+<span id=diffStatus style=margin-left:10px></span>
 </div>
 <div class=card id=out>pick two versions…</div>
 <script>
 const H = {"X-Session": localStorage.getItem("lp_session")};
+const svcEl = document.getElementById("svc");
+const frmEl = document.getElementById("frm");
+const toEl = document.getElementById("to");
+const statusEl = document.getElementById("diffStatus");
+const outEl = document.getElementById("out");
+
 async function init(){
   const svcs = await (await fetch("/api/services",{headers:H})).json();
-  svc.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name}</option>`).join("");
+  svcEl.innerHTML = svcs.map(x=>`<option value="${x.id}">${x.name}</option>`).join("");
   await fillVers();
-  svc.onchange = fillVers;
+  svcEl.onchange = fillVers;
   show();
 }
 async function fillVers(){
-  const id = svc.value;
+  const id = svcEl.value;
+  if (!id) return;
   const v = await (await fetch("/api/services/"+id+"/all_versions",{headers:H})).json();
   const deploys = await (await fetch("/api/deploys",{headers:H})).json();
   const good = new Set(), bad = new Set();
@@ -1067,29 +1158,29 @@ async function fillVers(){
   }
   const badge = t => good.has(t) ? ' <span class="badge good">good</span>'
                  : bad.has(t) ? ' <span class="badge bad">bad</span>' : "";
-  const opts = (v.all||[]).map(x=>`<option>${x}</option>`).join("");
-  frm.innerHTML = opts; to.innerHTML = opts;
-  [...frm.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
-  [...to.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
-  if (to.options.length>1) to.selectedIndex = 1;
+  const opts = (v.all||[]).map(x=>`<option value="${x}">${x}</option>`).join("");
+  frmEl.innerHTML = opts; toEl.innerHTML = opts;
+  [...frmEl.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
+  [...toEl.options].forEach(o=>o.innerHTML = o.value + badge(o.value));
+  if (toEl.options.length>1) toEl.selectedIndex = 1;
 }
-function esc(t){return t.replace(/&/g,"&amp;").replace(/</g,"&lt;")}
+function esc(t){return (t||"").replace(/&/g,"&amp;").replace(/</g,"&lt;")}
 function colorize(line){
   if (line.startsWith("+") && !line.startsWith("+++")) return '<span class=add>'+esc(line)+'</span>';
   if (line.startsWith("-") && !line.startsWith("---")) return '<span class=del>'+esc(line)+'</span>';
   return esc(line);
 }
 async function show(){
-  const id = svc.value, a = frm.value, b = to.value;
-  if (!a || !b || a===b){ out.innerHTML = "<i>pick two different versions</i>"; return; }
+  const id = svcEl.value, a = frmEl.value, b = toEl.value;
+  if (!a || !b || a===b){ outEl.innerHTML = "<i>pick two different versions</i>"; return; }
   const d = await (await fetch(`/api/services/${id}/diff?from=${a}&to=${b}`,{headers:H})).json();
-  if (d.error){ out.textContent = d.error; return; }
-  status.innerHTML = d.identical
+  if (d.error){ outEl.textContent = d.error; return; }
+  statusEl.innerHTML = d.identical
     ? '<span class="badge good" style=background:green>identical content — same code</span>'
     : `<b style=color:#1a3c6e>${a} → ${b}</b> — real git diff of the checked-out source`;
-  out.innerHTML = `
+  outEl.innerHTML = `
     <h2>Commits between ${a} and ${b}</h2>
-    ${d.commits.length ? `<table>${d.commits.map(c=>`<tr><td>${esc(c)}</td></tr>`).join("")}</table>` : "<i>none — same commit (tags point at the same tree)</i>"}
+    ${(d.commits && d.commits.length) ? `<table>${d.commits.map(c=>`<tr><td>${esc(c)}</td></tr>`).join("")}</table>` : "<i>none — same commit (tags point at the same tree)</i>"}
     <h2>Files changed</h2><pre>${esc(d.stat) || "no file changes"}</pre>
     <h2>Full diff (proof)</h2><pre>${d.diff ? d.diff.split("\n").map(colorize).join("\n") : "no content changes"}</pre>`;
 }
@@ -1156,9 +1247,11 @@ async function load(){
     : "<b style=color:red>Control plane: DEGRADED</b> — " + p.failed + " failing";
   const ds = await (await fetch("/api/deploys",{headers:H})).json();
   const seen = {};
-  svcs.innerHTML = ds.filter(d=>!seen[d.service]++).map(d =>
-    `<tr><td>${d.service}</td><td>${d.status}</td><td>${d.version} (${d.environment})</td>
-     <td><button onclick=rb('${d.service}',${d.id},${d.service_id})>Rollback</button></td></tr>`).join("")
+  svcs.innerHTML = ds.filter(d=>!seen[d.service + ":" + d.environment]++).map(d =>
+    `<tr><td><b>${d.service}</b></td>
+     <td style="color:${d.status==='healthy'?'green':d.status==='deploying'?'#1a6ec0':'#c0392b'}">${d.status}</td>
+     <td>${d.version} (${d.environment})</td>
+     <td><button onclick="rb('${d.service}',${d.id},${d.service_id},'${d.environment}')" style="background:#b35400;color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer">Roll back to good version</button></td></tr>`).join("")
     || "<tr><td colspan=4>no deploys visible for your team</td></tr>";
   const ev = await (await fetch("/api/events",{headers:H})).json();
   evs.innerHTML = ev.slice(0,12).map(e =>
@@ -1176,21 +1269,33 @@ function pselect(title, label, optionsHtml) {
       <b>${title}</b><p style="margin:8px 0 4px">${label}</p>
       <select id="ps-sel" style="width:100%;padding:6px">${optionsHtml}</select>
       <div style="margin-top:12px;text-align:right">
-        <button id="ps-cancel">Cancel</button>
-        <button id="ps-ok" style="background:#1a3c6e;color:#fff">Roll back</button></div></div>`;
+        <button id="ps-cancel" style="padding:6px 12px;margin-right:6px;cursor:pointer">Cancel</button>
+        <button id="ps-ok" style="background:#b35400;color:#fff;border:none;border-radius:4px;padding:6px 14px;cursor:pointer">Roll back</button></div></div>`;
     document.body.appendChild(ov);
     ov.querySelector("#ps-cancel").onclick = () => { ov.remove(); resolve(null); };
     ov.querySelector("#ps-ok").onclick = () => { const v = ov.querySelector("#ps-sel").value; ov.remove(); resolve(v); };
   });
 }
-async function rb(name, did, sid){
-  const r = await fetch("/api/services/"+sid+"/healthy_versions",{headers:H});
-  const versions = await r.json();
-  if (!versions.length) { alert("No healthy version to roll back to."); return; }
+async function rb(name, did, sid, env){
+  const url = "/api/services/"+sid+"/healthy_versions" + (env ? "?environment=" + env : "");
+  const r = await fetch(url, {headers:H});
+  let versions = await r.json();
+  if (!versions || !versions.length) {
+    const rAll = await fetch("/api/services/"+sid+"/healthy_versions", {headers:H});
+    versions = await rAll.json();
+  }
+  if (!versions || !versions.length) { alert("No healthy version to roll back to for " + name + "."); return; }
   const opts = versions.map(v=>`<option value="${v}">${v}</option>`).join("");
-  const v = await pselect("Roll back "+name, "Target version (healthy only)", opts);
+  const v = await pselect("Roll back "+name+" ["+(env||"env")+"]", "Target version (healthy only)", opts);
   if(!v) return;
-  await fetch("/api/deploys/"+did+"/rollback",{method:"POST",headers:{...H,"Content-Type":"application/json"},body:JSON.stringify({version:v})});
+  const res = await fetch("/api/deploys/"+did+"/rollback",{
+    method:"POST",
+    headers:{...H,"Content-Type":"application/json"},
+    body:JSON.stringify({version:v, environment:env})
+  });
+  const j = await res.json();
+  if (!res.ok) { alert(j.error || "Rollback failed"); return; }
+  alert("Rollback initiated for " + name + " to " + v + "!");
   load();
 }
 load();
@@ -1218,7 +1323,7 @@ button{padding:4px 10px;cursor:pointer}
 </div>
 <h2>All teams — what's running where</h2>
 <table><tr><th>Team</th><th>Service</th><th>State</th><th>Version (env)</th>
-<th>Deploy to staging</th><th>Push to production</th></tr>
+<th>Deploy to staging</th><th>Push to production</th><th>Rollback</th></tr>
 <tbody id=rows></tbody></table>
 <small>Staging buttons deploy the version healthy in staging's history (or latest built);
 Push to production promotes the version currently healthy in staging — nothing goes to prod without passing the staging gate first.</small>
@@ -1230,6 +1335,42 @@ if (!S) {
   location.href = "/";
 }
 const H = {"X-Session": S};
+
+function adminSelect(title, label, optionsHtml) {
+  return new Promise(resolve => {
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:99";
+    ov.innerHTML = `<div style="background:#fff;padding:18px 22px;border-radius:8px;min-width:320px;box-shadow:0 4px 14px rgba(0,0,0,.15)">
+      <b>${title}</b><p style="margin:8px 0 4px">${label}</p>
+      <select id="as-sel" style="width:100%;padding:6px;font-size:14px">${optionsHtml}</select>
+      <div style="margin-top:14px;text-align:right">
+        <button id="as-cancel" style="padding:6px 12px;margin-right:6px;cursor:pointer">Cancel</button>
+        <button id="as-ok" style="background:#b35400;color:#fff;border:none;border-radius:4px;padding:6px 14px;cursor:pointer">Roll back</button></div></div>`;
+    document.body.appendChild(ov);
+    ov.querySelector("#as-cancel").onclick = () => { ov.remove(); resolve(null); };
+    ov.querySelector("#as-ok").onclick = () => { const v = ov.querySelector("#as-sel").value; ov.remove(); resolve(v); };
+  });
+}
+
+async function adminRollback(name, sid, env){
+  if (!sid) { alert("Service ID not found."); return; }
+  const targetEnv = (env === "—" || !env ? "prod" : env);
+  const url = "/api/services/" + sid + "/healthy_versions?environment=" + targetEnv;
+  const r = await fetch(url, {headers: H});
+  let versions = await r.json();
+  if (!versions || !versions.length) {
+    const rAll = await fetch("/api/services/" + sid + "/healthy_versions", {headers: H});
+    versions = await rAll.json();
+  }
+  if (!versions || !versions.length) {
+    alert("No previous healthy version found to roll back to for " + name + ".");
+    return;
+  }
+  const opts = versions.map(v => `<option value="${v}">${v}</option>`).join("");
+  const v = await adminSelect("Roll back " + name + " [" + targetEnv + "]", "Select any previous good version to roll back to:", opts);
+  if (!v) return;
+  await call("/api/services/" + sid + "/rollback", {version: v, environment: targetEnv});
+}
 async function load(){
   try {
     const resMe = await fetch("/api/auth/me",{headers:H});
@@ -1285,9 +1426,10 @@ async function load(){
         <td style="color:${s.status==='running'?'green':'#b35400'}">${s.status}</td>
         <td>${s.version} (${s.env})</td>
         <td><button onclick=deployStaging(${sid})>Deploy to staging</button></td>
-        <td><button onclick=promoteSvc(${sid}) style="background:#1a6ec0;color:#fff">Push to production</button></td></tr>`;
+        <td><button onclick=promoteSvc(${sid}) style="background:#1a6ec0;color:#fff">Push to production</button></td>
+        <td><button onclick="adminRollback('${s.service}',${sid},'${s.env}')" style="background:#b35400;color:#fff">Roll back to good version</button></td></tr>`;
     }
-  rows.innerHTML = html;
+  rows.innerHTML = html || "<tr><td colspan=7>No services registered yet</td></tr>";
 
   // delivery metrics: per service bars for failure%, deploys/day, MTTR, lead time
   const m = await (await fetch("/api/metrics",{headers:H})).json();
