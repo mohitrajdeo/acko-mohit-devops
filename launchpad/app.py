@@ -580,13 +580,19 @@ def api_admin_overview():
                 "last_events": [dict(e) for e in last_events],
             }
 
+    tot = preflight.get("total")
+    fail = preflight.get("failed") or 0
+    if tot is not None and isinstance(tot, int):
+        cp_detail = f"{max(0, tot - fail)}/{tot} checks passed"
+    else:
+        cp_detail = "preflight has not run yet (click 'Re-run control-plane checks')"
+
     return jsonify(teams=teams,
                    team_detail=team_detail,
                    resources=_system_resources(),
                    failures_24h={r["team"]: r["n"] for r in recent},
-                   control_plane=preflight["status"],
-                   control_plane_detail=f"{preflight.get('total', '?') - (preflight.get('failed') or 0)}"
-                                        f"/{preflight.get('total', '?')} checks passed")
+                   control_plane=preflight.get("status", "UNKNOWN"),
+                   control_plane_detail=cp_detail)
 
 
 @app.get("/api/auth/me")
@@ -1131,10 +1137,19 @@ button{padding:4px 10px;cursor:pointer} .lead{color:#555;font-size:13px}
 <table><tr><th>At</th><th>Event</th><th>Detail</th></tr><tbody id=evs></tbody></table>
 <script>
 const S = localStorage.getItem("lp_session");
+if (!S) {
+  location.href = "/";
+}
 const H = {"X-Session": S};
 async function load(){
-  const me = await (await fetch("/api/auth/me",{headers:H})).json();
-  who.textContent = me.username + " (" + me.role + ", " + me.team + ")";
+  try {
+    const resMe = await fetch("/api/auth/me",{headers:H});
+    if (resMe.status === 401) {
+      location.href = "/";
+      return;
+    }
+    const me = await resMe.json();
+    who.textContent = me.username + " (" + me.role + ", " + me.team + ")";
   const p = await (await fetch("/api/preflight",{headers:H})).json();
   status.innerHTML = p.status==="READY"
     ? "<b style=color:green>Control plane: ALL OK</b> ("+p.total+"/"+p.total+")"
@@ -1148,6 +1163,10 @@ async function load(){
   const ev = await (await fetch("/api/events",{headers:H})).json();
   evs.innerHTML = ev.slice(0,12).map(e =>
     `<tr><td>${e.created_at}</td><td><b>${e.type}</b></td><td>${String(e.detail).slice(0,80)}</td></tr>`).join("");
+  } catch (err) {
+    console.error("Dashboard error:", err);
+    status.innerHTML = `<b style=color:red>Error: ${err.message}</b>`;
+  }
 }
 function pselect(title, label, optionsHtml) {
   return new Promise(resolve => {
@@ -1207,11 +1226,29 @@ Push to production promotes the version currently healthy in staging — nothing
 <div id=teamcards></div>
 <script>
 const S = localStorage.getItem("lp_session");
+if (!S) {
+  location.href = "/";
+}
 const H = {"X-Session": S};
 async function load(){
-  const me = await (await fetch("/api/auth/me",{headers:H})).json();
-  who.textContent = me.username + " (manager)";
-  const o = await (await fetch("/api/admin/overview",{headers:H})).json();
+  try {
+    const resMe = await fetch("/api/auth/me",{headers:H});
+    if (resMe.status === 401) {
+      location.href = "/";
+      return;
+    }
+    const me = await resMe.json();
+    if (me.role !== "manager") {
+      location.href = "/dashboard";
+      return;
+    }
+    who.textContent = me.username + " (manager)";
+    const resO = await fetch("/api/admin/overview",{headers:H});
+    if (!resO.ok) {
+      cp.innerHTML = `<span class=bad>● Server Error (${resO.status})</span>`;
+      return;
+    }
+    const o = await resO.json();
   cp.innerHTML = o.control_plane==="READY"
     ? "<span class=ok>● READY</span> — " + o.control_plane_detail
     : "<span class=bad>● " + o.control_plane + "</span> — " + o.control_plane_detail;
@@ -1282,11 +1319,35 @@ async function load(){
         ${t.last_events.map(e=>`<tr><td>${e.created_at}</td><td><b>${e.type}</b></td><td>${String(e.detail).slice(0,60)}</td></tr>`).join("")}
       </table>
     </div>`).join("");
+  } catch(err) {
+    console.error("Dashboard render error:", err);
+    cp.innerHTML = `<span class=bad>● UI Error: ${err.message}</span>`;
+  }
 }
 async function runPreflight(){
   cp.textContent = "running checks…";
   await (await fetch("/api/preflight",{headers:H})).json();
   load();
+}
+async function call(url, body){
+  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json", ...H},
+                               body: JSON.stringify(body || {})});
+  const j = await r.json();
+  if (!r.ok) { alert(j.error || "Action failed"); }
+  else { alert("Success: " + JSON.stringify(j)); }
+  load();
+}
+async function promoteSvc(id){
+  if (!confirm("Promote healthy staging version to production?")) return;
+  await call("/api/services/" + id + "/promote", {});
+}
+async function deployStaging(sid){
+  const av = await (await fetch("/api/services/" + sid + "/all_versions", {headers:H})).json();
+  const deploys = await (await fetch("/api/deploys", {headers:H})).json();
+  const goodStg = deploys.filter(d => d.service_id == sid && d.environment === "staging" && d.status === "healthy");
+  const v = (goodStg[0] && goodStg[0].version) || (av.built && av.built[0]) || (av.all && av.all[0]);
+  if (!v) { alert("No versions available — build one first."); return; }
+  await call("/api/services/" + sid + "/deploy", {version: v, environment: "staging"});
 }
 load();
 </script></body></html>"""
@@ -1439,6 +1500,13 @@ async function rollbackSvc(name) {{
 
 
 if __name__ == "__main__":
+    import sys, os
     init_db()
+    port = int(os.environ.get("PORT", 7000))
+    if "--port" in sys.argv:
+        try:
+            port = int(sys.argv[sys.argv.index("--port") + 1])
+        except (ValueError, IndexError):
+            pass
     threading.Thread(target=_watchdog_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=7000)
+    app.run(host="0.0.0.0", port=port)
